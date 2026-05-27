@@ -1,0 +1,12 @@
+.git
+.gitignore
+*.md
+Dockerfile
+docker-compose*.yml
+.dockerignore
+.github
+out/
+tmp/
+*.log
+*.pem
+*.key

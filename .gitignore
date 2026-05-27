@@ -1,0 +1,29 @@
+# build artifacts (anchored to repo root - не задеть cmd/mxtr-server/ dir)
+/dist/
+/out/
+/mxtr-server
+/mxtr-testclient-v2
+*.exe
+
+# go
+*.test
+*.prof
+/vendor/
+
+# secrets - never commit
+.env
+.env.*
+*.pem
+*.key
+
+# internal audit notes (kept locally, not for public mirror)
+/.audit/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

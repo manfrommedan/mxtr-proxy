@@ -1,0 +1,49 @@
+# mxtr-proxy compose. Drop on any docker-enabled host and `docker compose
+# up -d --build`. Put a .env next to this file (chmod 600):
+#
+#   MXTR_PSK=<64-hex-char PSK from `docker run --rm mxtr-proxy -gen-psk`>
+#   MXTR_PUBLIC_HOST=your-vps.example.com
+#   # Optional target allowlist (subdomains auto-included, no wildcard syntax):
+#   MXTR_ALLOW=matrix.org,element.io
+
+services:
+  mxtr:
+    build:
+      context: .
+      args:
+        VERSION: "${VERSION:-dev}"
+    image: mxtr-proxy:${VERSION:-dev}
+    container_name: mxtr-proxy
+    restart: unless-stopped
+    # Host networking so the TLS listener binds directly to :9290 without
+    # docker NAT overhead and DPI sees a normal-looking socket.
+    network_mode: host
+    environment:
+      MXTR_PSK: ${MXTR_PSK:?MXTR_PSK must be set in .env}
+    command:
+      - "-tcp"
+      - ":9290"
+      - "-log-level"
+      - "info"
+      - "-public-host"
+      - "${MXTR_PUBLIC_HOST:-}"
+      # Conditional via shell expansion: docker compose doesn't have if/else,
+      # but an empty -allow value is rejected at parse time, so leave the
+      # flag out entirely when MXTR_ALLOW is unset. Override `command` in an
+      # override file for whitelist + LE cert combos.
+    # Operational hygiene: no privileged mode, drop all caps, read-only fs.
+    cap_drop:
+      - ALL
+    read_only: true
+    # tmpfs survives a future CGO toggle that wants to write trampolines to
+    # /tmp; with read_only and no tmpfs the container would silently break.
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    # Bounded log retention. Share-string contains the PSK, keep tight.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "3"
