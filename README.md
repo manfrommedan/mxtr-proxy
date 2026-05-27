@@ -26,16 +26,15 @@ general-purpose-прокси, **не** замена VPN, **не** конкуре
 ## Quick start
 
 Одной строкой на VPS (Docker required). Замени `your-vps.example.com` на
-свой hostname или IP, скопируй целиком и в консоль:
+свой hostname или IP и копируй целиком:
 
 ```bash
 docker run -d --name mxtr-proxy --restart unless-stopped --network host -e MXTR_PSK=$(docker run --rm ghcr.io/manfrommedan/mxtr-proxy:latest -gen-psk) ghcr.io/manfrommedan/mxtr-proxy:latest -tcp :9290 -public-host your-vps.example.com && sleep 2 && docker logs mxtr-proxy 2>&1 | grep share-string
 ```
 
-Меняешь `your-vps.example.com` на свой hostname или IP. На выходе - готовая
-share-string в формате `mxtr://<base58-PSK>@<host>:9290`. Её вставить в
-`Настройки → Расширенные → АнтиЦензурный прокси` в форке Element X+,
-перезапустить app, готово.
+На выходе - готовая share-string в формате `mxtr://<base58-PSK>@<host>:9290`.
+Вставить в `Настройки → Расширенные → АнтиЦензурный прокси` в форке
+Element X+, перезапустить app, готово.
 
 Не забудь открыть порт: `ufw allow 9290/tcp` (или `iptables -A INPUT -p tcp --dport 9290 -j ACCEPT`).
 
