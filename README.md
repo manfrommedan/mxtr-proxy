@@ -25,33 +25,25 @@ general-purpose-прокси, **не** замена VPN, **не** конкуре
 
 ## Quick start
 
+Одной строкой на VPS (Docker required):
+
 ```bash
-git clone https://github.com/<you>/mxtr-proxy /opt/mxtr-proxy
-cd /opt/mxtr-proxy
-
-# 1. PSK
-docker run --rm $(docker build -q .) -gen-psk
-
-# 2. .env (chmod 600)
-cat >.env <<'EOF'
-MXTR_PSK=<paste-hex-from-step-1>
-MXTR_PUBLIC_HOST=your-vps.example.com
-# MXTR_ALLOW=matrix.org,element.io   # опционально, см. docs/THREAT-MODEL.md
-EOF
-chmod 600 .env
-
-# 3. Поднять
-docker compose up -d --build
-
-# 4. Share-string в логе
-docker compose logs | grep share-string
-# mxtr://<base58-PSK>@<host>:9290
+docker run -d --name mxtr-proxy --restart unless-stopped --network host \
+  -e MXTR_PSK=$(docker run --rm ghcr.io/manfrommedan/mxtr-proxy:latest -gen-psk) \
+  ghcr.io/manfrommedan/mxtr-proxy:latest -tcp :9290 -public-host your-vps.example.com \
+  && sleep 2 && docker logs mxtr-proxy 2>&1 | grep share-string
 ```
 
-Эту share-string вставить в `Настройки → Расширенные → АнтиЦензурный
-прокси` в форке Element X+. Перезапустить app. Готово.
+Меняешь `your-vps.example.com` на свой hostname или IP. На выходе - готовая
+share-string в формате `mxtr://<base58-PSK>@<host>:9290`. Её вставить в
+`Настройки → Расширенные → АнтиЦензурный прокси` в форке Element X+,
+перезапустить app, готово.
 
-Подробности - в [docs/INSTALL-SERVER.md](docs/INSTALL-SERVER.md).
+Не забудь открыть порт: `ufw allow 9290/tcp` (или `iptables -A INPUT -p tcp --dport 9290 -j ACCEPT`).
+
+Для production-сетапа с hardening (read-only fs, cap_drop, ротация
+PSK, target-allowlist, compose, LE-сертификат) - см.
+[docs/INSTALL-SERVER.md](docs/INSTALL-SERVER.md).
 
 ## Документация
 
