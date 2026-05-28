@@ -724,15 +724,6 @@ func writeServerHandshake(conn net.Conn) (nonceS []byte, err error) {
 var connCounter int64
 
 
-// isIPLiteral returns true iff s is a numeric IPv4 or IPv6 address. We use
-// net.ParseIP and accept whatever it accepts (dotted-quad, full and compact
-// IPv6, IPv4-mapped IPv6). Hostnames are refused so clients never trigger a
-// DNS query that an RU resolver could poison.
-func isIPLiteral(s string) bool {
-	s = strings.TrimPrefix(strings.TrimSuffix(s, "]"), "[")
-	return net.ParseIP(s) != nil
-}
-
 // isValidHostname enforces RFC 1035 label syntax for the -sni flag: dot-
 // separated labels of [a-zA-Z0-9-], no leading/trailing hyphen per label,
 // each label 1-63 chars, total length up to 253. Refuses IP literals so
