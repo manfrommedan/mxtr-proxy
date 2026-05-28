@@ -39,7 +39,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -790,7 +789,7 @@ func isPublicIPLiteral(s string) bool {
 // server is started with -psk-file pointed at a directory the attacker
 // can write to).
 func secureCreateExclFile(path string, mode os.FileMode) (*os.File, error) {
-	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, mode)
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|oNoFollow, mode)
 }
 
 // writeFileSecure writes data to path, refusing symlink targets and
