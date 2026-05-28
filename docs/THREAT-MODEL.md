@@ -10,26 +10,37 @@ mxtr-proxy спроектирован против конкретных прот
 по большому корпусу легитимного и подозрительного трафика. **Не может**
 выборочно вмешиваться в реальном времени (только block по правилу).
 
-**Что видит**: TLS-1.3 ClientHello → ServerHello → application data. Без
-SNI extension (или с CN под Cloudflare). ALPN h2. Дальше - случайные
-байты с распределением как у нормального HTTPS-трафика.
+**Что видит**: TLS-1.3 ClientHello с SNI = synthetic CDN-edge hostname
+(`<region><N>.edge.fastly.net` / `node-<city>-<N>.bunnycdn.com` и т.д.,
+~1.8M возможных значений, выбирается на VPS при первом старте и
+персистится). ServerHello с cert subject = тому же hostname. ALPN h2 +
+http/1.1. Дальше - случайные байты с распределением как у нормального
+HTTPS-трафика.
 
 **Защита**:
 
-- Per-PSK fingerprint randomisation. Camouflage server-header,
-  порядок ALPN, cadence heartbeat - всё выводится из PSK. Pattern,
-  обученный на одном deployment'е, не покрывает другой. РКН не может
-  забанить "класс mxtr-серверов" одним правилом.
-- Power-of-2 padding на каждом фрейме. Размеры данных не утекают:
-  90-байтное и 1024-байтное сообщения выглядят одинаково.
+- Per-PSK randomisation ALPN-порядка и heartbeat cadence.
+- Per-host persisted identity: cloak family (один из 6: nginx, Apache,
+  LiteSpeed, Caddy, cloudflare, Go-stdlib) и cert CN выбираются один
+  раз и сохраняются на диск. Restart не меняет identity - реальный
+  nginx тоже не меняет 500-страницу при рестарте. Перевыбор identity на
+  каждом startup - сам по себе tell.
+- 13-rung PADME padding ladder + size-scaled probabilistic bump
+  (30/18/8% для <1KB/<4KB/>=4KB). Размеры данных размазаны по 13 buckets,
+  гистограмма не имеет острых spike'ов.
 - Random padding в handshake. Первый пакет после TLS не имеет
-  фиксированной длины.
+  фиксированной длины (1-256 байт padding).
+- PING-PONG jitter 0-15ms. Убит "every PING matched by PONG within 1ms"
+  timing tell, который читает flow-shape ML.
+- SNI совпадает с cert subject - нет "domain fronting tell"
+  (SNI≠cert subject - то что TSPU активно отслеживает с 2022).
 
 **Чего не делает**: GREASE-extensions в TLS-1.3. Чистая Java TLS-1.3 без
-GREASE на фоне Chrome выделяется (Chrome всегда добавляет GREASE).
-Если ТСПУ когда-нибудь начнёт детектить TLS-1.3-без-GREASE как
-"подозрительный" - все Java/OpenSSL-клиенты попадут в один блок, не
-только mxtr.
+GREASE на фоне Chrome выделяется (Chrome всегда добавляет GREASE). На
+Android API 29+ JSSE по факту = Conscrypt, который GREASE отдаёт - но
+не для всех версий ровно. Если ТСПУ когда-нибудь начнёт детектить
+TLS-1.3-без-GREASE как "подозрительный" - все Java/OpenSSL-клиенты
+попадут в один блок, не только mxtr.
 
 **Цена ошибки**: блокировка по IP. См. противника D.
 
@@ -42,29 +53,38 @@ TLS-handshake без полезных данных, или как попытка
 
 **Что видит зонд**:
 
-| Зонд                             | Что отдаёт mxtr-proxy                  |
-|----------------------------------|----------------------------------------|
-| `curl https://host:9290/`        | TLS-1.3 + 500-страница (nginx/Apache/LSWS) |
-| `nc host 9290` + случайные байты | TLS-handshake → дальше hang 60 секунд  |
-| Telnet до timeout                | пустой TLS-handshake → drop            |
-| Правильный handshake, неверный PSK | TLS → mxtr handshake → HMAC fail → RST|
+| Зонд                                | Что отдаёт mxtr-proxy                          |
+|-------------------------------------|------------------------------------------------|
+| `curl https://host:<port>/`         | TLS-1.3 + случайно 403/404/500 одного из 6 семейств + family-specific headers и body |
+| `curl https://host:<port>/robots.txt` | TLS-1.3 + 200 + `User-agent: *\nDisallow:\n` |
+| `nc host <port>` + случайные байты  | TLS-handshake → дальше hang 60 секунд          |
+| Telnet до timeout                   | пустой TLS-handshake → drop                    |
+| Правильный handshake, неверный PSK  | TLS → mxtr handshake → HMAC fail → hang 60с    |
 
 **Защита**:
 
-- camouflage 500 идентичен реальному misconfigured-серверу,
-  включая `Date:` header в HTTP-формате и `Server:` под выбранную
-  семью (выбор детерминирован из PSK, у разных деплоев разные).
-- 60-секундный hang при невалидных байтах - дороже одного зонда,
-  чем РКН готов потратить (один зондирующий запрос занимает один
-  fd на минуту).
-- HMAC-fail при неверном PSK не отвечает - зонд не получает
-  положительного сигнала о том, что попал на mxtr.
+- 6 шаблонов 500-страниц (nginx, Apache, LiteSpeed, Caddy, cloudflare,
+  Go-stdlib), один выбирается на первом старте и **сохраняется** -
+  Server-header consistent across requests/restarts. На каждый
+  отдельный probe **статус случайный** из {403, 404, 500} - не пинимый
+  "всегда 500" tell. Версии в Server header не показываем (matches
+  `server_tokens off` / `ServerSignature Off` на реальном production).
+- Path-aware ответы. `/robots.txt` - 200 с реалистичным телом, как у
+  любого public-facing HTTP-сервера. Pinned 500-on-everything (то что
+  делает большинство простых cloak'ов) - tell.
+- 60-секундный hang при невалидных байтах **И** при HMAC-fail - один
+  зондирующий запрос занимает fd на минуту, для massive scanning
+  стоимость растёт линейно.
+- Cert subject - synthetic из ~1.8M space, не enumerable dictionary.
+  Cloak family и cert CN persisted - rotation across restarts не
+  выдаёт паттерн (`-rotate-cloak` форсирует когда оператор сам решит).
 
-**Чего не делает**: domain fronting. Если стратегия зондирования
-включает «сравни сертификат с сертификатом реального известного
-домена» - у self-signed нет такой проверки, но и нет реального
-домена за ним. Контрмера: ставить настоящий LE-сертификат под
-реальный домен (см. [INSTALL-SERVER.md](INSTALL-SERVER.md)).
+**Чего не делает**: TCP-splice до реального сайта (как у `telemt`).
+Если стратегия зондирования включает «сравни TLS-handshake с настоящим
+handshake'ом известного домена» - у нас self-signed cert не пройдёт
+проверку chain-to-CA. Контрмера: использовать `-cert/-key/-sni` с
+реальным LE-cert и доменом (см. [INSTALL-SERVER.md](INSTALL-SERVER.md)).
+На 443 + LE + SNI=твой-домен сервер выглядит как обычный HTTPS-сайт.
 
 ## Противник C. Утечка PSK
 

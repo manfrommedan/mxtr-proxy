@@ -10,10 +10,10 @@ nonce.
 [matrix-rust-sdk / WebView]
        │ HTTP CONNECT host:port
        ▼
-[in-app listener 127.0.0.1:1984]
+[in-app listener 127.0.0.1:1984]    (auto-fallback на 1984..1993 если 1984 занят)
        │ mxtr v2 stream-multiplexed
-       ▼ TLS 1.3
-[mxtr-server, port 9290]
+       ▼ TLS 1.3 (SNI = persisted CN)
+[mxtr-server, port из share-string]
        │ plain TCP
        ▼
 [matrix.org / element.io / OIDC IdP]
@@ -22,15 +22,27 @@ nonce.
 ## TLS layer
 
 TLS-1.3 only (`enabledProtocols=["TLSv1.3"]` на клиенте и сервере). По
-умолчанию self-signed cert. CN ротируется из набора plausible CDN-edge
-имён (Cloudflare, Fastly, BunnyCDN и т.д.), выбор детерминирован от
-PSK через HKDF - каждый деплой выглядит чуть-чуть по-разному.
+умолчанию self-signed cert; опционально - реальный LE-cert через
+`-cert/-key` (RSA или EC, клиент принимает оба).
 
-ALPN: server проксирует `h2,http/1.1` (порядок тоже выбирается из PSK).
+**Self-signed CN** генерится из синтетического пула ~1.8 млн имён по 7
+реальным CDN-шаблонам (`<region><N>.edge.fastly.net`,
+`node-<city>-<N>.bunnycdn.com`, `a<N>.<city>.edge.akamaiedge.net` и
+т.д.). RKN не может составить словарь - сетку из ~10 fixed имён мы
+выбросили. Выбранное имя **персистится** в файл рядом с PSK (по умолчанию
+`./mxtr-cert.cn`), рестарт сохраняет identity. `-rotate-cloak` форсирует
+переброс.
+
+**SNI в ClientHello** = тот же CN (передаётся через `?sni=<cn>` в
+share-string). Сервер представляет cert с тем же subject. Совпадение
+SNI/cert на wire - нет "SNI≠cert" тели, которую TSPU отслеживает с 2022.
+
+ALPN: server предлагает `h2,http/1.1` (порядок выбирается из PSK).
 Так пассивный наблюдатель видит обычный CDN, отдающий HTTP/2.
 
 Аутентификация - **не** через X509, а через PSK-HMAC внутри handshake
-(см. ниже). Клиент игнорирует cert: PSK гарантирует mutual auth.
+(см. ниже). Клиент проверяет в cert только: chain не пустой, не
+просрочен, алгоритм EC или RSA. PSK гарантирует mutual auth.
 
 ## Handshake (после TLS)
 
@@ -85,11 +97,14 @@ tag'а уже сидят в конце). Соответственно `maxCipher
 (16384 padded plaintext + 16 tag).
 
 `real_len` - сколько байт в plaintext'е настоящие, остальное в
-inner-фрейме - случайный padding до следующей рунги фиксированной
-лесенки: `{256, 512, 1024, 2048, 4096, 8192, 16384}`. То есть даже
-4-байтный полезный payload идёт на проводе в виде 256-байтного inner
-плюс 16 байт tag'а. Реальное распределение длин превращается в этот
-дискретный набор и пропадает как сигнал для DPI.
+inner-фрейме - случайный padding до выбранной рунги PADME-style лесенки:
+`{256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384}`
+(13 рунг с 1.5x половинными шагами вместо строгих power-of-2). Размер
+выбирается **size-scaled probabilistic bump**: для payload <1KB с 30%
+шансом padder прыгает на следующую рунгу, для 1-4KB - 18%, для >4KB - 8%.
+Так гистограмма размеров на wire размазана по 13 buckets вместо 7 spike'ов,
+без overhead'а на больших фреймах. Bump - независимое решение клиента и
+сервера, согласовывать не нужно (wire несёт только ciphertext-длину).
 
 Reuse nonce, обрезка фрейма, или decrypt при несовпадающем seq - сразу
 teardown сессии.
@@ -140,24 +155,38 @@ teardown сессии.
 SO_TIMEOUT на TLS-сокете = `heartbeatMaxMs + 30_000`. Если за это время
 ни одного байта не прилетело - сессия мёртвая, рвём.
 
-## Camouflage 500
+## Camouflage HTTP
 
 Если на тот же порт пришёл запрос, который **не** прошёл mxtr-handshake
-(пустой read, или валидный HTTP/1.1/HTTP/2 без CONNECT) - сервер
-отвечает правдоподобной 500-страницей одного из трёх вариантов
-(nginx/Apache/LiteSpeed). Выбор по PSK, плюс корректные заголовки:
+(пустой read, или валидный HTTP/1.1/HTTP/2) - сервер отвечает как
+обычный, плохо сконфигурированный web-сервер. Шесть семейств шаблонов,
+по одному на startup, **выбор персистится** (`mxtr-cloak.idx` рядом с
+PSK, restart сохраняет identity):
 
-- `Server: nginx/1.27.4` (или `Apache/2.4.62`, или `LiteSpeed`)
-- `Date: <Tue, 27 May 2026 12:34:56 GMT>` (текущее UTC в формате
-  HTTP-date)
-- `Content-Type: text/html`
-- `Connection: close`
+- nginx
+- Apache
+- LiteSpeed
+- Caddy
+- cloudflare
+- generic Go-stdlib (пустой Server header)
 
-Тело - стилизованный под выбранный сервер HTML с 500. Сам сервер тогда
-ничего не знает о PSK зонда: он просто прикинулся плохо
-сконфигурированным веб-сервером.
+**Версии скрыты**: только family name, как `server_tokens off` /
+`ServerSignature Off` на реальном production. На каждый probe **статус
+выбирается случайно** из {403, 404, 500} - не пинимый "всегда 500" tell.
 
-`curl -ksv https://<vps-ip>:9290/` от любого зеваки увидит ровно это.
+Path-aware ответы:
+
+| Path                  | Ответ                                |
+|-----------------------|--------------------------------------|
+| `/robots.txt`         | 200, `User-agent: *\nDisallow:\n`    |
+| любой другой          | случайно из 403/404/500 + family body|
+
+Headers совпадают с тем что реально отдаёт каждый family
+(`Cache-Control` у Cloudflare, `Strict-Transport-Security` у Caddy и т.д.).
+`Date:` всегда текущий UTC.
+
+`curl -ksv https://<vps-ip>:<port>/` от любого зеваки увидит ровно это.
+`curl https://<vps-ip>:<port>/robots.txt` - реалистичный 200.
 
 ## Per-PSK runtime config
 
@@ -171,7 +200,7 @@ HKDF-SHA256(
   info = "mxtr-config-v1",
 )  ->  16 bytes  ->  разбивается на:
 
-  out[0]                     -> camouflage_template_idx  (nginx | apache | litespeed)
+  out[0]                     -> camouflage_template_idx  (nginx|apache|litespeed|caddy|cloudflare|stdlib)
   out[1] & 1                 -> alpn_order               (h2,http/1.1 | http/1.1,h2)
   20_000 + out[2]*100        -> heartbeat_min_ms         (20.0-45.5s)
   45_000 + out[3]*100        -> heartbeat_max_ms         (45.0-70.5s)
@@ -180,22 +209,32 @@ HKDF-SHA256(
   10_000 + out[8]*50         -> idle_threshold_ms        (10.0-22.75s)
 ```
 
-Два разных деплоя, разные PSK → разный camouflage server-header,
-разный порядок ALPN, разная cadence heartbeat. Pattern-detector,
-обученный на одном deployment'е, не покрывает другой.
+Два разных деплоя, разные PSK → разный порядок ALPN, разная cadence
+heartbeat. Pattern-detector, обученный на одном deployment'е, не
+покрывает другой.
 
-Handshake jitter (5-50 мс), наоборот, **не** PSK-derived - это
-фиксированные константы `jitterMinMS`/`jitterMaxMS`. Если когда-нибудь
-понадобится развести и его - расширить структуру `pskDerivedConfig`.
+Camouflage family НЕ PSK-derived в текущей версии: выбор делается
+crypto/rand на первом startup и **персистится** на диск. Это нужно
+чтобы restart не менял Server-header (real nginx так не делает).
+`out[0]` всё ещё доступен в коде для будущего fallback на PSK-derived
+выбор, но в активном пути не используется.
+
+**Handshake jitter** (5-50 мс на server-hello): фиксированные константы
+`jitterMinMS`/`jitterMaxMS`. Отдельно есть **PING-PONG jitter** 0-15 мс:
+сервер отвечает PONG с дополнительной случайной задержкой через goroutine,
+чтобы убить "every PING matched by PONG within 1ms" timing tell, который
+читает flow-shape ML.
 
 ## Активный зонд: что увидит
 
-| Зонд                             | Ответ сервера                          |
-|----------------------------------|----------------------------------------|
-| `curl https://host:9290/`        | TLS-1.3, h2, HTML 500 nginx/Apache/LSWS|
-| `nc host 9290` + случайные байты | TLS-1.3 handshake → дальше hang 60с    |
-| Правильный mxtr-handshake (wrong PSK) | TLS → mxtr ack → HMAC fail → RST  |
-| Telnet до timeout                | пустой TLS-handshake (no SNI) → drop   |
+| Зонд                                | Ответ сервера                                |
+|-------------------------------------|----------------------------------------------|
+| `curl https://host:<port>/`         | TLS-1.3 + h2 + случайно 403/404/500 одного из 6 семейств, headers совпадают с тем что реально отдаёт это family |
+| `curl https://host:<port>/robots.txt` | TLS-1.3 + h2 + 200 + `User-agent: *\nDisallow:\n` |
+| `nc host <port>` + случайные байты  | TLS-1.3 handshake → дальше hang 60с          |
+| Правильный mxtr-handshake (wrong PSK)| TLS → читает MAC → fail → hang 60с          |
+| TLS handshake без SNI               | принимаем, отдаём cert (SNI tolerant)        |
+| TLS handshake с любым SNI           | принимаем, отдаём cert (один cert на listener)|
 
 ## Security properties
 
@@ -213,13 +252,34 @@ PSK - единая точка отказа. Ротировать при подо
 никогда не покидает device локально - кроме того момента, когда
 оператор раздаёт share-string по защищённому каналу.
 
+## Persisted state
+
+Все длительные параметры сохраняются на диск рядом с PSK file:
+
+- `psk.hex` - 64 hex char PSK. Auto-генерится при первом запуске если
+  ни `-psk`, ни `MXTR_PSK`, ни существующий файл не дают значения.
+  Hardening: создаётся через `O_CREATE|O_EXCL|O_NOFOLLOW` + atomic rename;
+  symlink на путь файла защищён (rename подменяет inode, target не
+  трогаем). chmod 600 после write.
+- `mxtr-cloak.idx` - индекс выбранного camouflage family (0..5).
+- `mxtr-cert.cn` - сгенерированное CN для self-signed cert.
+
+Restart сохраняет cloak family и cert CN - реальный nginx тоже не
+меняет 500-страницу при рестарте. `-rotate-cloak` явно ротирует обе
+(и cloak idx, и cert CN) одновременно: оператор выбирает когда менять
+identity.
+
 ## Что протокол НЕ делает
 
 - Не делает GREASE TLS extensions (хорошо: меньше fingerprint surface,
   плохо: чистая TLS-1.3 без GREASE сама по себе чуть-чуть выделяется
-  на фоне Chrome/Firefox).
-- Не делает domain fronting через CDN. Камуфляж - только camouflage
-  500 + per-PSK fingerprint randomisation.
+  на фоне Chrome/Firefox). На Android API 29+ JSSE = Conscrypt, который
+  GREASE отдаёт - но не на всех версиях ровно.
+- Не делает domain fronting через CDN. Камуфляж - synthetic CN +
+  camouflage HTTP + persisted identity. SNI совпадает с cert: domain
+  fronting (SNI≠cert) - **классический tell**, мы его избегаем.
+- Не делает TCP-splice cloak до реального сайта (как `telemt`). Для
+  personal-VPS избыточно.
 - Не имеет congestion-control сверх TCP. Один сокет = одно окно. При
   20+ потоках с разными RTT возможны head-of-line stalls. Для матрикс
   это нормально (REST + sync-loop, не bulk).

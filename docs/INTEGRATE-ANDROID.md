@@ -32,13 +32,18 @@ SOCKS-прокси и **не** VPN: это in-process HTTP CONNECT-листен�
 ```
 libraries/matrix/impl/src/main/kotlin/io/element/android/libraries/matrix/impl/mxtr/
 ├── Base58.kt                  # base58 encode/decode для PSK в share-string
-├── MxtrConfig.kt              # константы: LOCAL_PROXY_HOST=127.0.0.1, PORT=1984
-├── MxtrCrypto.kt              # HKDF, AEAD wrap/unwrap, TLS-1.3 SSLContext
-├── MxtrHttpProxy.kt           # HTTP CONNECT-листенер + worker pool
+├── MxtrConfig.kt              # PREFERRED_LOCAL_PROXY_PORT=1984 + activeLocalPort
+│                              #   (auto-fallback 1984..1993 если первый занят)
+├── MxtrCrypto.kt              # HKDF, AEAD wrap/unwrap, TLS-1.3 SSLContext;
+│                              #   trust manager принимает EC + RSA leaf (для real LE-cert)
+├── MxtrHttpProxy.kt           # HTTP CONNECT-листенер + bindWithFallback по портам
 ├── MxtrPreferencesStore.kt    # DataStore с enabled/share-string
-├── MxtrPskDerivedConfig.kt    # из PSK выводим camouflage/ALPN/heartbeat
-├── MxtrSession.kt             # TLS+handshake, reader/heartbeat threads
-├── MxtrShareString.kt         # parse/emit mxtr://psk@host:port
+├── MxtrPskDerivedConfig.kt    # из PSK выводим ALPN/heartbeat (camouflage больше не PSK-derived)
+├── MxtrSession.kt             # TLS+handshake, reader/heartbeat threads;
+│                              #   connect(sni=...) ставит SNI в outer ClientHello;
+│                              #   13-rung PADME padding ladder + size-scaled bump
+├── MxtrShareString.kt         # parse/emit mxtr://psk@ip:port?sni=hostname;
+│                              #   IP-literal validated regex'ом (no DNS lookup)
 ├── MxtrStats.kt               # счётчики для диагностики
 └── MxtrStream.kt              # один поток внутри сессии (OPEN/DATA/CLOSE)
 
@@ -115,7 +120,10 @@ embedded WebView где-то ещё):
 object MxtrWebViewProxy {
     fun applyGlobally(context: Context) {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.PROXY_OVERRIDE)) return
-        val proxy = "${MxtrConfig.LOCAL_PROXY_HOST}:${MxtrConfig.LOCAL_PROXY_PORT}"
+        // activeLocalPort() возвращает фактически забинденный порт. Если
+        // 1984 был занят при старте, MxtrHttpProxy.bindWithFallback взял
+        // следующий свободный из 1984..1993 и обновил атомик.
+        val proxy = "${MxtrConfig.LOCAL_PROXY_HOST}:${MxtrConfig.activeLocalPort()}"
         val config = ProxyConfig.Builder()
             .addProxyRule(proxy)
             .addDirect("localhost", "127.0.0.1")
@@ -283,35 +291,46 @@ scope.launch {
   push-через-proxy - надо переходить на NTFY / собственный
   push-gateway.
 - Не пытайся проверять TLS-cert сервера через стандартный X509.
-  Сертификат сервера self-signed by design. Аутентификация - через
-  PSK-HMAC, она происходит **после** TLS handshake. См. `MxtrCrypto.kt`.
+  Сертификат сервера self-signed by design (CN из ~1.8 млн
+  synthetic CDN-edge namespace, выбирается на первом старте и
+  персистится). Аутентификация - через PSK-HMAC, она происходит
+  **после** TLS handshake. Trust manager делает только sanity-check:
+  chain не пустой, не просрочен, алгоритм EC или RSA (RSA нужен
+  чтобы реальный LE-cert через `-cert/-key` тоже работал, дефолтный
+  certbot отдаёт RSA-2026). См. `MxtrCrypto.kt`.
 
 ## Тестирование
 
 ```bash
 # 1. Поднять локальный сервер
 go build -o mxtr-server ./cmd/mxtr-server
-MXTR_PSK=$(openssl rand -hex 32) ./mxtr-server -tcp :9290 -log-level debug &
+mkdir -p /tmp/mxtr-state && chmod 700 /tmp/mxtr-state
+./mxtr-server -tcp :<port> -public-ip 127.0.0.1 \
+  -psk-file /tmp/mxtr-state/psk.hex -log-level debug &
 echo $!  # запомнить pid для kill
+# в stderr появится готовая share-string mxtr://...@127.0.0.1:<port>?sni=...
 
-# 2. В DataStore приложения положить share-string
-# (через UI или adb shell run-as).
+# 2. В DataStore приложения положить эту share-string целиком
+# (через UI или adb shell run-as). ?sni= обязательно копировать -
+# без него ClientHello не приложит SNI extension и заходящий пакет
+# будет легче распознать.
 
 # 3. Запустить app, открыть Settings -> Расширенные -> АнтиЦензурный прокси,
 #    включить, перезапустить app.
 
-# 4. Логи приложения: должно быть "MxtrProxy: listening on 127.0.0.1:1984"
-#    и "mxtr-session-reader" thread.
+# 4. Логи приложения: должно быть "MxtrProxy: listening on 127.0.0.1:<port>"
+#    (или 1985..1993 если 1984 был занят) и "mxtr-session-reader" thread.
 
-# 5. Логи сервера: при login должно появиться "accept from <ip>",
-#    "handshake ok", "stream open -> matrix.org:443".
+# 5. Логи сервера: при login должно появиться "session established from <ip>",
+#    "stream <N> -> matrix.org:443".
 ```
 
 Если matrix-rust-sdk ругается на `Bad Gateway 502` - значит CONNECT
 дошёл до листенера, а `MxtrSession` не подняла поток. Часто это:
-- неправильный share-string (валидатор показал бы красным, но если
-  скопировал по проводу с обрезанием - проверь длину);
-- сервер не доступен (telnet vps-ip 9290);
+- share-string не парсится: hostname в host position (новый парсер
+  принимает только IP-литерал), отсутствует ?sni= когда server его
+  ждёт, base58-PSK не 32 байта;
+- сервер не доступен (telnet vps-ip <port>);
 - TLS не поднялся (включи `-log-level debug` на сервере).
 
 Если matrix-rust-sdk не делает CONNECT вообще - `ProxyProvider.provides()`

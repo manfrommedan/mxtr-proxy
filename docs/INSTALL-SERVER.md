@@ -1,11 +1,15 @@
 # Установка сервера
 
 Сервер - один Go-бинарь без зависимостей. Запускается на любом VPS с
-открытым TCP-портом. Рекомендуемая площадка: Hetzner, OVH, Vultr, DO -
-любой не-RU/CIS провайдер, который не обязан отвечать на запросы РКН.
+открытым TCP-портом. Площадка: Hetzner, OVH, Vultr, DO - любой не-RU/CIS
+провайдер, который не обязан отвечать на запросы РКН.
 
-Минимум: 1 vCPU, 256 МБ RAM, 1 ГБ диска. Сервер одинаково тянет 10 и
-2000 одновременных клиентов: вся работа per-conn это AEAD-копия буфера.
+Минимум: 1 vCPU, 512 МБ RAM, 1 ГБ диска. Сервер тянет 1000+
+одновременных клиентов на 1 vCPU: AEAD-копии буфера идут через
+sync.Pool, на горячих аллокациях GC pressure ~10x ниже чем без пула.
+maxConcurrentConns по умолчанию 8192 (запас на reconnect-churn + probe
+storms). Для 1000+ юзеров поставь `ulimit -n 65536` и
+`sysctl -w net.netfilter.nf_conntrack_max=131072` на хосте.
 
 ## Вариант 1. Docker (рекомендуется)
 
@@ -13,109 +17,137 @@
 git clone https://github.com/<you>/mxtr-proxy /opt/mxtr-proxy
 cd /opt/mxtr-proxy
 
-# 1. Сгенерировать PSK (32 случайных байта в hex).
-docker run --rm $(docker build -q .) -gen-psk
-# вывод: 64-символьная hex-строка. Сохрани, она же пойдёт в .env и
-# в share-string для каждого клиента.
+# 1. Создать persistent volume для state.
+mkdir -p /opt/mxtr-proxy/state
+chmod 700 /opt/mxtr-proxy/state
 
-# 2. Положить .env (chmod 600, в нём секрет).
-cat >.env <<'EOF'
-MXTR_PSK=PASTE_64_HEX_CHARS_HERE
-MXTR_PUBLIC_HOST=your-vps.example.com
-# опционально: ограничить proxy списком целевых доменов
-# (поддомены включаются автоматически, без вилдкардов)
-# MXTR_ALLOW=matrix.org,element.io
-EOF
-chmod 600 .env
+# 2. Поднять. PSK сгенерится на первом старте и запишется в state/psk.hex.
+docker run -d --name mxtr-proxy \
+  --restart unless-stopped \
+  --network host \
+  --read-only \
+  --tmpfs /tmp:size=16m,mode=1777 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  -v /opt/mxtr-proxy/state:/state \
+  --log-driver json-file --log-opt max-size=1m --log-opt max-file=3 \
+  ghcr.io/<you>/mxtr-proxy:latest \
+  -tcp :<port> -public-ip <vps-ip> -psk-file /state/psk.hex
 
-# 3. Поднять.
-docker compose up -d --build
-
-# 4. Проверить.
-docker compose logs --tail=20
-# в логе должно быть: "PSK-derived config" и "TLS listening on :9290"
-curl -ksv https://<vps-ip>:9290/
-# должно отдать HTTP/2 500 с заголовком server: nginx (или Apache, или
-# LiteSpeed - выбирается из PSK, у разных деплоев разные).
+# 3. Проверить.
+docker logs mxtr-proxy 2>&1 | grep -E 'cert-cn|cloak|share-string|listening'
+curl -ksv https://<vps-ip>:<port>/
+# должен отдать случайно 403/404/500 одного из 6 cloak-семейств
+# (nginx/Apache/LiteSpeed/Caddy/cloudflare/Go-stdlib) - выбирается
+# на первом старте и персистится в state/mxtr-cloak.idx
 ```
 
-Контейнер запускается под `nonroot`, с `cap_drop: ALL`, `read_only`,
-`no-new-privileges`, `network_mode: host` (чтобы TLS-сокет был прямой,
-без docker NAT) и ротируемыми JSON-логами (1 МБ × 3).
+Контейнер запускается под `nonroot:nonroot`, с `cap_drop: ALL`,
+`read_only` (`/state` единственный writable mount), `no-new-privileges`,
+`network_mode: host` (TLS-сокет прямой, без docker NAT).
 
 ### Share-string
 
-При старте сервер печатает в лог:
+При первом старте сервер печатает:
 
 ```
-share-string: mxtr://<base58-PSK>@<MXTR_PUBLIC_HOST>:9290
+share-string: mxtr://<base58-PSK>@<vps-ip>:<port>?sni=<edge-name>
 ```
 
-Эту строку (и только её) надо передать на устройство клиента. Канал
-передачи - такой же, как для пароля от почты: Signal, PGP, бумажка.
-Base58 PSK - единственный долговременный секрет.
+Эту строку надо передать на устройство клиента. Канал: Signal, PGP,
+бумажка. PSK + SNI - вместе один секрет (SNI публично, но привязан к
+конкретному cert subject на сервере, рассылать оба обязательно).
+
+На последующих рестартах share-string печатается тот же самый: PSK +
+cloak family + cert CN персистятся в `/state/` и переживают рестарт.
+Реальный nginx тоже не меняет 500-страницу при рестарте.
+
+### State directory layout
+
+```
+/opt/mxtr-proxy/state/
+├── psk.hex            # PSK, 64 hex chars + \n, chmod 600
+├── mxtr-cloak.idx     # camouflage family index (0..5)
+└── mxtr-cert.cn       # synthetic CDN-edge CN для self-signed cert
+```
+
+Все файлы создаются с `O_CREATE|O_EXCL|O_NOFOLLOW` + atomic rename -
+подменить symlink'ом нельзя.
+
+### Ротация cloak identity
+
+Если хочется сменить Server-header и cert CN (не PSK):
+
+```bash
+docker stop mxtr-proxy
+docker rm mxtr-proxy
+# тот же docker run с дополнительным флагом -rotate-cloak
+docker run -d --name mxtr-proxy ... -rotate-cloak ...
+# выберет новый cloak family + новый cert CN, перепишет state
+# выдаст НОВУЮ share-string (новый ?sni= в ней) - надо разослать
+```
 
 ### Ротация PSK
 
 ```bash
-docker run --rm mxtr-proxy:dev -gen-psk   # новый ключ
-nano .env                                  # обновить MXTR_PSK
-docker compose up -d                       # рестарт
+docker stop mxtr-proxy
+rm /opt/mxtr-proxy/state/psk.hex   # удалить старый
+docker start mxtr-proxy            # auto-генерит новый
+docker logs mxtr-proxy | grep share-string  # получить новый
 ```
 
-Старые share-string перестают работать сразу - всем клиентам нужно
-вставить новую строку.
+Старые share-string перестают работать сразу. Всем клиентам нужно
+вставить новую строку (включая новый PSK).
 
-### TLS-сертификат
+### Реальный LE-cert
 
-По умолчанию self-signed cert с CN под Cloudflare/Fastly/BunnyCDN/прочее
-(выбирается из PSK). Клиент аутентифицирует сервер через PSK-HMAC,
-сертификат не проверяет - так удобнее: нет лимитов Let's Encrypt и нет
-записи в Certificate Transparency, которая бы засветила host.
+По умолчанию self-signed cert с synthetic CN
+(`<region><N>.edge.fastly.net` и т.д.). Если хочется реальный
+Let's Encrypt - получи cert на свой домен, прокинь файлы внутрь
+контейнера, добавь `-cert/-key/-sni`:
 
-Если всё-таки нужен LE, override через `docker-compose.override.yml`:
-
-```yaml
-services:
-  mxtr:
-    volumes:
-      - /etc/letsencrypt/live/your-domain/fullchain.pem:/run/secrets/cert.pem:ro
-      - /etc/letsencrypt/live/your-domain/privkey.pem:/run/secrets/key.pem:ro
-    command:
-      - "-tcp"
-      - ":9290"
-      - "-cert"
-      - "/run/secrets/cert.pem"
-      - "-key"
-      - "/run/secrets/key.pem"
-      - "-log-level"
-      - "warn"
+```bash
+docker stop mxtr-proxy && docker rm mxtr-proxy
+docker run -d --name mxtr-proxy ... \
+  -v /etc/letsencrypt/live/<домен>/fullchain.pem:/secrets/cert.pem:ro \
+  -v /etc/letsencrypt/live/<домен>/privkey.pem:/secrets/key.pem:ro \
+  ghcr.io/<you>/mxtr-proxy:latest \
+  -tcp :443 -public-ip <vps-ip> \
+  -psk-file /state/psk.hex \
+  -cert /secrets/cert.pem -key /secrets/key.pem \
+  -sni <домен>
 ```
+
+На 443 + real LE + SNI=твой-домен сервер выглядит как обычный
+HTTPS-сайт. Это самый сильный антидпи-режим: живём в haystack'е HTTPS.
+
+Renewal certbot'ом: добавь в его deploy-hook
+`docker restart mxtr-proxy` (контейнер перечитает cert на старте).
 
 ### Файрвол
 
 ```bash
-ufw allow 9290/tcp
+ufw allow <port>/tcp
 # или
-iptables -A INPUT -p tcp --dport 9290 -j ACCEPT
+iptables -A INPUT -p tcp --dport <port> -j ACCEPT
 ```
 
-Если провайдер запрещает нестандартные порты, поменяй `-tcp :9290` и
-`EXPOSE` на `:443`. На том же IP больше ничего на 443 висеть не должно.
+Если провайдер запрещает нестандартные порты, ставь 443 - но на нём
+больше ничего не должно слушать (nginx/caddy на том же IP конфликтуют).
 
-### Операционка
+### Allowlist целевых доменов
+
+По умолчанию proxy тоннелит куда угодно. Если хочется ограничить (чтобы
+PSK-leak не превратил тебя в open-relay):
 
 ```bash
-docker compose ps              # статус
-docker compose logs -f         # хвост
-docker compose restart         # перезапуск
-docker compose down            # остановить + снести
-
-docker compose up -d --build   # обновить после git pull
+docker stop mxtr-proxy && docker rm mxtr-proxy
+docker run -d --name mxtr-proxy ... \
+  -allow matrix.org,element.io,call.matrix.org,turn.livekit.cloud
 ```
 
-`restart: unless-stopped` переживает перезагрузку - systemd-юнит не
-нужен.
+Поддомены включаются автоматически (`matrix.org` покроет
+`matrix-client.matrix.org`, `account.matrix.org` и т.д.). Без вилдкардов.
 
 ## Вариант 2. Сборка из исходников
 
@@ -126,73 +158,51 @@ git clone https://github.com/<you>/mxtr-proxy
 cd mxtr-proxy
 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o mxtr-server ./cmd/mxtr-server
 
-# PSK
-./mxtr-server -gen-psk
-# 64 hex-символа в stdout
+mkdir -p /var/lib/mxtr && chmod 700 /var/lib/mxtr
 
-# Запуск
-MXTR_PSK=<paste-hex> ./mxtr-server -tcp :9290 -public-host your-vps.example.com
+./mxtr-server -tcp :<port> -public-ip <vps-ip> -psk-file /var/lib/mxtr/psk.hex
+# PSK сгенерится и запишется автоматически.
 ```
 
 Все флаги:
 
 ```
--tcp string          адрес TCP-листенера (default ":9290")
--cert string         путь к TLS cert (PEM); пусто = self-signed
--key string          путь к TLS key (PEM); пусто = self-signed
--public-host string  hostname для share-string (по умолчанию hostname машины)
--allow string        whitelist целевых доменов через запятую
--log-level string    silent | warn | info | debug (default "info")
--gen-psk             выводит новый PSK в stdout и выходит
-```
-
-systemd-юнит, если очень нужно:
-
-```ini
-# /etc/systemd/system/mxtr-proxy.service
-[Unit]
-Description=mxtr-proxy
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=mxtr
-EnvironmentFile=/etc/mxtr-proxy.env
-ExecStart=/usr/local/bin/mxtr-server -tcp :9290 -public-host your-vps.example.com
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-PrivateDevices=true
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin mxtr
-sudo install -m 755 mxtr-server /usr/local/bin/
-echo "MXTR_PSK=<hex>" | sudo tee /etc/mxtr-proxy.env
-sudo chmod 600 /etc/mxtr-proxy.env
-sudo systemctl daemon-reload
-sudo systemctl enable --now mxtr-proxy
+-tcp string           TCP-листенер (default ":9290")
+-psk string           PSK как hex (override env и -psk-file)
+-psk-file string      путь к PSK файлу (default "./mxtr-psk.hex");
+                      создаётся с random 32-byte PSK на первом запуске
+-cert string          путь к TLS cert (PEM); пусто = self-signed
+-key string           путь к TLS key (PEM); требуется при -cert
+-sni string           hostname для ClientHello SNI и share-string;
+                      пусто = берётся из cert CN
+-public-ip string     публичный IPv4/IPv6 literal для share-string;
+                      hostnames refused; пусто = auto-detect
+-cloak-state string   путь к persisted cloak idx (default <psk-file dir>/mxtr-cloak.idx)
+-rotate-cloak         форсировать fresh cloak family + cert CN
+-allow string         whitelist целевых доменов через запятую
+-log-level string     off | error | warn | info | debug (default "info")
+-quiet                shorthand для -log-level=off (PSK не попадёт в stderr)
+-gen-psk              выводит новый PSK в stdout и выходит
 ```
 
 ## Проверка работы
 
 ```bash
-# 1. Активное зондирование: сервер должен прикинуться нормальным веб-сервером.
-curl -ksv https://<vps-ip>:9290/
-# HTTP/2 500
-# server: nginx/1.27.4
-# date: Mon, 27 May 2026 ...
+# 1. Активное зондирование: сервер должен прикинуться cdn-edge с 4xx/5xx.
+curl -ksv https://<vps-ip>:<port>/
+# HTTP/2 403 (или 404, или 500) + server: nginx (или один из 6 семейств)
+# date: <текущее UTC>
+
+# 1b. /robots.txt - 200, реалистичный.
+curl -ksv https://<vps-ip>:<port>/robots.txt
+# HTTP/2 200
+# User-agent: *
+# Disallow:
 
 # 2. Туннель: testclient через SOCKS5 на localhost:1984.
 go build -o mxtr-testclient ./cmd/mxtr-testclient-v2
-MXTR_PSK=<hex> ./mxtr-testclient -server <vps-ip>:9290 -socks :1984 &
+SHARE='<скопируй из docker logs grep share-string>'
+./mxtr-testclient -share "$SHARE" -socks-addr :1984 -method socks5 &
 curl --socks5 127.0.0.1:1984 https://matrix.org/_matrix/client/versions
 # должен прийти JSON со списком версий
 ```
@@ -202,9 +212,10 @@ curl --socks5 127.0.0.1:1984 https://matrix.org/_matrix/client/versions
 - Не мультиплексирует разные PSK на одном порту. Один PSK на деплой.
   Хочешь изоляцию между пользователями - запусти несколько контейнеров
   на разных портах или IP.
-- Не лимитит per-IP. На уровне PSK это не нужно (PSK уже гейтит
-  доступ). Если хочешь публично - ставь `iptables --hashlimit` спереди.
-- Не делает domain fronting. DPI-resistance держится на camouflage 500
-  и per-PSK fingerprint, а не на чужом CDN.
+- Не лимитит per-IP. Поставь `iptables --hashlimit` или nginx-фронт
+  если нужен публичный shared-сервис.
+- Не делает domain fronting. DPI-resistance держится на synthetic CN +
+  camouflage HTTP + SNI совпадает с cert. Domain fronting (SNI≠cert) -
+  это классический tell, мы его специально избегаем.
 - Не экспортит метрики и не телеметрит. Никаких outbound-соединений,
   кроме тех, что инициировал клиент через CONNECT.

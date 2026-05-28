@@ -9,8 +9,11 @@ BunnyCDN-стиль): тот же IP при `curl https://...` отдаёт
 
 Создавался под форк Element X+ (наш Android-клиент Matrix). Это **не**
 general-purpose-прокси, **не** замена VPN, **не** конкурент MTProto.
-Применимость - своя ниша: Matrix через matrix-rust-sdk + один-два
-пользователя на personal-VPS.
+Применимость - Matrix через matrix-rust-sdk. По производительности на
+1 vCPU / 1 GB VPS тянет ~1000+ одновременных пользователей на типичной
+Matrix-нагрузке (/sync long-poll + редкие burst'ы) - sync.Pool на
+горячих AEAD-аллокациях, 13-rung padding, persisted identity, всё уже
+посчитано под scale.
 
 ## Что в репозитории
 
@@ -25,18 +28,28 @@ general-purpose-прокси, **не** замена VPN, **не** конкуре
 
 ## Quick start
 
-Одной строкой на VPS (Docker required). Замени `your-vps.example.com` на
-свой hostname или IP и копируй целиком:
+Одной строкой на VPS (Docker required). Замени `<vps-ip>` на свой публичный
+IPv4 и `<port>` на любой свободный порт (примеры ниже используют `<port>` как
+placeholder — выбирай нестандартный, не 443/80/22):
 
 ```bash
-docker run -d --name mxtr-proxy --restart unless-stopped --network host -e MXTR_PSK=$(docker run --rm ghcr.io/manfrommedan/mxtr-proxy:latest -gen-psk) ghcr.io/manfrommedan/mxtr-proxy:latest -tcp :9290 -public-host your-vps.example.com && sleep 2 && docker logs mxtr-proxy 2>&1 | grep share-string
+docker run -d --name mxtr-proxy --restart unless-stopped --network host \
+  -v /opt/mxtr-proxy/state:/state \
+  ghcr.io/manfrommedan/mxtr-proxy:latest \
+  -tcp :<port> -public-ip <vps-ip> -psk-file /state/psk.hex
+sleep 2 && docker logs mxtr-proxy 2>&1 | grep share-string
 ```
 
-На выходе - готовая share-string в формате `mxtr://<base58-PSK>@<host>:9290`.
+На выходе - готовая share-string в формате
+`mxtr://<base58-PSK>@<vps-ip>:<port>?sni=<edge-name>`. PSK на первом
+запуске генерится и пишется в `/state/psk.hex` (`chmod 600`); cert CN +
+cloak family тоже персистятся туда же, рестарт identity сохраняет.
+
 Вставить в `Настройки → Расширенные → АнтиЦензурный прокси` в форке
 Element X+, перезапустить app, готово.
 
-Не забудь открыть порт: `ufw allow 9290/tcp` (или `iptables -A INPUT -p tcp --dport 9290 -j ACCEPT`).
+Не забудь открыть порт: `ufw allow <port>/tcp` (или
+`iptables -A INPUT -p tcp --dport <port> -j ACCEPT`).
 
 Для production-сетапа с hardening (read-only fs, cap_drop, ротация
 PSK, target-allowlist, compose, LE-сертификат) - см.
@@ -72,8 +85,11 @@ PSK, target-allowlist, compose, LE-сертификат) - см.
   списков IP, нет CDN-точки отказа. Каждый поднимает свой VPS, сам
   раздаёт share-string своему кругу. РКН нечего блокировать оптом -
   только заходить per-IP, а они между собой ничем не связаны.
-- Устойчив к зондированию: `curl https://<vps>:9290/` отдаёт
-  500-страницу с правдоподобным `Server:` и текущим `Date:`.
+- Устойчив к зондированию: `curl https://<vps-ip>:<port>/` отдаёт
+  случайно-выбранную 403/404/500-страницу одного из 6 семейств
+  (nginx/Apache/LiteSpeed/Caddy/Cloudflare/Go-stdlib) с пинной
+  Server-header (без версии) и текущим `Date:`. Семейство и cert CN
+  выбираются один раз и персистятся — restart не меняет identity.
   Не-HTTP байты висят 60 секунд. Зонд не получает ни одного
   положительного сигнала.
 - Один long-lived TLS-сокет на всю сессию, N параллельных потоков
@@ -99,7 +115,8 @@ PSK, target-allowlist, compose, LE-сертификат) - см.
 - Не general-purpose. Заточен под matrix-rust-sdk и форк Element X+.
   Адаптация под другой клиент описана в
   [INTEGRATE-ANDROID.md](docs/INTEGRATE-ANDROID.md), но руками.
-- Не shared-сервис. Один оператор - один VPS - один PSK.
+- Не shared-сервис в смысле multi-tenancy: один PSK на деплой. Но
+  1000+ пользователей под одним PSK на одной VPS - норма.
 - Оверхед по трафику есть: 16 байт AEAD-tag на фрейм + power-of-2
   padding (обфускация размеров стоит обычно 30-50% поверх payload).
   На LTE заметно, на Wi-Fi нет.

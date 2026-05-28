@@ -101,45 +101,58 @@ Java-инфраструктура с JSSE, всё что ходит через O
 ТСПУ-сервисы РКН. Это «too big to ban» уровня TLS-1.3 целиком.
 mxtr оказывается в стае, а не одиночкой.
 
-### 2. Per-PSK runtime config
+### 2. Per-PSK runtime config + persisted per-deploy identity
 
 MTProxy: один статичный fingerprint на все деплойменты. РКН увидел
 `0xfe02` extension - забанил весь класс.
 
-mxtr: из PSK через HKDF выводится набор runtime-параметров:
+mxtr из PSK через HKDF выводит:
 
-- camouflage server family (nginx/Apache/LiteSpeed) - что отдаёт
-  500-страница при HTTP-зондировании
 - порядок ALPN (h2,http/1.1 или http/1.1,h2)
-- cadence heartbeat (15-25с min, 60-90с max)
-- handshake jitter (5-50ms)
+- cadence heartbeat (~20-70с разброс, разный per PSK)
+- размеры padding в heartbeat'е (32-287 min, 512-4095 max)
 
-Два деплоя с разными PSK выглядят по-разному для зондирования. Pattern,
-обученный на одном, не покрывает другой. РКН не может забанить
-"класс mxtr-серверов" одним правилом.
+Плюс **persisted at first startup**:
 
-### 3. Camouflage 500 с правильным Date-header
+- camouflage family - один из 6 (nginx/Apache/LiteSpeed/Caddy/cloudflare/Go-stdlib),
+  выбирается crypto/rand на первом запуске и сохраняется в файл
+  рядом с PSK. Restart сохраняет identity (реальный nginx тоже не меняет
+  500-страницу при рестарте, перевыбор - сам по себе tell).
+- TLS cert CN - синтетический CDN-edge name из ~1.8 млн комбинаций
+  (60 cities × 7 CDN patterns × 99 number positions), персистится.
+  Restart не меняет subject - cert тоже выглядит стабильным.
+- `-rotate-cloak` форсирует пересборку обоих одновременно: оператор
+  выбирает когда менять identity.
+
+Два деплоя с разными PSK выглядят по-разному. РКН не может забанить
+"класс mxtr-серверов" одним правилом. Если кто-то поднимет много
+деплоев с тем же PSK - cert/cloak всё равно разные per host, потому
+что персистенция идёт через crypto/rand на каждом отдельном диске.
+
+### 3. Camouflage HTTP - 6 семейств, random 403/404/500, path-aware
 
 MTProxy: при зондировании без правильного secret - молчит / timeout /
 RST. Поведение характерно (Frolov NDSS 2020 как раз про это: timeout +
 порог байтов - надёжный признак «proxy, устойчивый к зондированию»).
 
-mxtr: при HTTP-зондировании отвечает правдоподобной 500-страницей. Полный
-HTTP-ответ:
+mxtr: при HTTP-зондировании отвечает как обычный, плохо
+сконфигурированный web-сервер. 6 семейств шаблонов (nginx, Apache,
+LiteSpeed, Caddy, cloudflare, generic Go-stdlib), один выбирается на
+первом старте и **сохраняется**. На каждый отдельный probe статус
+выбирается случайно из {403, 404, 500} с family-specific body и
+headers (`Cache-Control`+`Vary` у Cloudflare,
+`Strict-Transport-Security` у Caddy и т.д.). **Версии скрыты**: только
+`server: nginx` / `server: Apache` без минорных версий - matches
+production `server_tokens off`/`ServerSignature Off`.
 
-```
-HTTP/2 500
-server: nginx/1.27.4
-date: Tue, 27 May 2026 12:34:56 GMT
-content-type: text/html
-connection: close
+Path-aware: `/robots.txt` отвечает 200 с реалистичным телом
+`User-agent: *\nDisallow:\n`. Real CDN edge всегда так делает на
+public-facing порту, а pinned 500-on-everything - tell.
 
-<html>... 500 Internal Server Error ...</html>
-```
-
-`curl -ksv https://<vps-ip>:9290/` от зеваки даёт точно такой output.
-Если зондирование приходит как НЕ-HTTP байтопоток - 60-секундный
-hang, что дороже одного зонда, чем РКН готов потратить.
+`curl -ksv https://<vps-ip>:<port>/` от зеваки даёт случайно
+выбранный 4xx/5xx правдоподобной структуры. Если зондирование
+приходит как НЕ-HTTP байтопоток - 60-секундный hang, что дороже
+одного зонда, чем РКН готов потратить.
 
 ### 4. Stream multiplexing на один TLS-сокет
 
@@ -152,14 +165,34 @@ Handshake амортизируется. Для Matrix важно: matrix-rust-sd
 делят один outer сокет. С точки зрения DPI это **одна** TLS-сессия
 с переменным application-data flow.
 
-### 5. Power-of-2 padding
+### 5. PADME-style padding ladder + size-scaled bump
 
-MTProxy: paddы есть, но не отбивают размеры до power-of-2.
+MTProxy: paddы есть, но не отбивают размеры до фиксированной решётки -
+обычно +0..15 случайных байт.
 
-mxtr: каждый фрейм паддится до следующей степени двойки.
-90-байтное сообщение и 1024-байтное на wire одинаковые - оба 1024-байтные
-ciphertext'ы. Распределение размеров /sync-чанков превращается в
-дискретный набор {32, 64, 128, 256, 512, 1024, 2048, ...}.
+mxtr: 13-rung PADME-style ladder с 1.5x половинными шагами вместо
+строгих power-of-2: `{256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+6144, 8192, 12288, 16384}`. Размер выбирается **size-scaled probabilistic
+bump**: для payload <1KB с 30% шансом padder прыгает на следующую
+рунгу, для 1-4KB - 18%, для >4KB - 8%. Гистограмма размеров на wire
+размазана по 13 buckets вместо 7 spike'ов, без overhead'а на больших
+фреймах. Bump-решение делается independently на каждой стороне (wire
+видит только зашифрованную длину) - синхронизировать не нужно.
+
+### 6. SNI совпадает с cert (anti-domain-fronting tell)
+
+TSPU с 2022 активно отслеживает "SNI≠ServerHello.cert.subject" -
+классический паттерн domain fronting. mxtr **специально избегает**:
+share-string несёт `?sni=<hostname>` который сервер записал в
+generated cert CN. Клиент шлёт этот hostname в ClientHello, сервер
+представляет cert с тем же subject. Согласованно.
+
+Кроме того mxtr не шлёт **пустой SNI** или **IP-литерал в SNI**: оба
+эти варианта - сильный tell (90%+ реального HTTPS-трафика SNI шлёт
+нормальным hostname'ом, "TLS без SNI на VPS" моментально
+маркируется ML как probable proxy). Без `?sni=` в share-string fall
+back на IP - но это режим, когда оператор сам решил пожертвовать
+скрытностью.
 
 ## Что mxtr делает так же или хуже
 
@@ -167,7 +200,7 @@ ciphertext'ы. Распределение размеров /sync-чанков п
 
 | Свойство | MTProxy (mtg v2 / telemt) | mxtr |
 |---|---|---|
-| Domain fronting (cloak host) | да | нет |
+| Domain fronting (cloak host) | да | **намеренно нет** (SNI≠cert это TSPU-tracked tell) |
 | Transparent TCP splice до реального сайта | telemt - да | нет |
 | Forward secrecy на уровне PSK | нет | нет |
 | Per-conn PSK rotation | нет | нет |
@@ -203,11 +236,12 @@ mxtr использует deterministic seq counter в AEAD-nonce - реплей
 
 **Производительность**. Серверный код MTProxy 2019 года был оптимизирован
 до десятков тысяч conn/sec на одно ядро (без CGo, без GC pauses).
-Go-сервер mxtr достигает порядков ниже потолок: GC на каждый AEAD
-allocate, sync.Pool бы помог. Это сознательное упрощение - mxtr
-не публичный shared-сервис. На 1 vCPU / 1 GB VPS легко тянет сотни
-одновременных пользователей на типичной Matrix-нагрузке (/sync
-long-poll + редкие burst'ы), оптимизация конн/сек тут не нужна.
+Go-сервер mxtr с 2026-05 имеет sync.Pool на inner/ct frame буферах -
+~10x меньше allocations/sec при ~2-5k frames/sec нагрузке (1000+
+конкурентных сессий). На 1 vCPU / 1 GB VPS тянет 1000+ одновременных
+пользователей при типичной Matrix-нагрузке (/sync long-poll + редкие
+burst'ы). До C-производительности не дотягивает, но для personal-VPS
+с десятками-сотнями людей вокруг себя - запас.
 
 **Multi-secret на одном порту**. У mxtr один PSK = один деплой. Для
 изоляции 10 пользователей нужно 10 контейнеров или 10 портов.
@@ -242,17 +276,20 @@ alexbers/mtprotoproxy умеет 1 порт = N secrets. Это пока в road
 | Серверный язык / runtime | C (offic.) / Go (mtg) / Rust+Tokio (telemt) / Python (alexbers) | Go |
 | Стейт серверного code-base | официальный заброшен Telegram, живут форки | актив |
 | Outer layer | fake-TLS (имитация) | настоящий TLS-1.3 |
-| Ответ на зондирование | timeout / hang (offic., alexbers) → real TLS splice (telemt) | HTTP 500 (nginx/Apache/LSWS) |
-| JA3 уникальность | один на весь deploy | per-PSK |
+| Ответ на зондирование | timeout / hang (offic., alexbers) → real TLS splice (telemt) | случайно 403/404/500 одного из 6 семейств + path-aware /robots.txt=200 |
+| Cert subject | один на весь deploy | synthetic из ~1.8M space, persisted per host |
+| SNI tracking | не явно адресовано | SNI=cert subject в share-string, no domain-fronting tell |
 | Stream mux | нет | да |
-| Padding | случайный (mtg v2) | power-of-2 + случайный |
-| Domain fronting / cloak | mtg v2 + telemt - да | нет |
-| Настоящий cert chain в ответ на зонд | telemt - да | нет (self-signed) |
+| Padding | случайный +0..15B (mtg) | 13-rung PADME ladder + size-scaled bump (30/18/8%) |
+| Domain fronting / cloak | mtg v2 + telemt - да | намеренно нет |
+| Настоящий cert chain в ответ на зонд | telemt - да | optional через -cert/-key (RSA или EC), default self-signed |
 | Replay-protection | encrypted timestamp (mtg / telemt) | AEAD seq counter |
 | Forward secrecy (PSK) | нет | нет |
+| Persisted identity (cloak + cert + PSK на диск) | не явно | да, atomic write + O_NOFOLLOW + O_EXCL |
 | Multi-secret | да | нет |
 | Ad-tag / monetisation | mtg v1 / telemt / alexbers - да | n/a |
-| Conn/sec потолок (1 vCPU) | десятки тысяч (offic. C, telemt Rust) | сотни-тысячи (Go GC-bound) |
+| sync.Pool на AEAD frames | n/a | да (масштаб 1000+ conn без GC pressure) |
+| Conn/sec потолок (1 vCPU) | десятки тысяч (offic. C, telemt Rust) | сотни-тысячи (Go GC-bound, но pool снижает) |
 | Что блокировано в RU 2026 | JA3 detected 2026-04, fix client-only | в дикой природе единицы deploy'ев, ниже радара |
 
 ## Когда использовать что
