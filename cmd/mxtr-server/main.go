@@ -82,8 +82,15 @@ const (
 	dialTimeout       = 10 * time.Second
 	maxHTTPHeaderRead = 8192
 
-	jitterMinMS = 5
-	jitterMaxMS = 50
+	// Server-side jitter before writing the mxtr handshake response. Kills
+	// the "instant reply" timing tell that DPI uses to fingerprint
+	// proxies (real servers don't reply in <1ms, processing time always
+	// shows). Tightened from 5-50ms to 1-15ms 2026-05-28: 5-50 added an
+	// avg 27ms to every first-connect for ~negligible extra DPI defense;
+	// 1-15 (mean 8ms) buries the deterministic processing time
+	// (~0.5-2ms) just as effectively while saving ~20ms per cold start.
+	jitterMinMS = 1
+	jitterMaxMS = 15
 )
 
 var psk []byte
