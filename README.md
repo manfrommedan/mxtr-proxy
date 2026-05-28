@@ -9,11 +9,22 @@ BunnyCDN-стиль): тот же IP при `curl https://...` отдаёт
 
 Создавался под форк Element X+ (наш Android-клиент Matrix). Это **не**
 general-purpose-прокси, **не** замена VPN, **не** конкурент MTProto.
-Применимость - Matrix через matrix-rust-sdk. По производительности на
-1 vCPU / 1 GB VPS тянет ~1000+ одновременных пользователей на типичной
-Matrix-нагрузке (/sync long-poll + редкие burst'ы) - sync.Pool на
-горячих AEAD-аллокациях, 13-rung padding, persisted identity, всё уже
-посчитано под scale.
+Применимость - Matrix через matrix-rust-sdk.
+
+**Производительность на разных VPS** (типичная Matrix-нагрузка - /sync
+long-poll + редкие burst'ы):
+
+| VPS spec                      | Цена $/мес | Одновременных юзеров          |
+|-------------------------------|-----------|--------------------------------|
+| 1 vCPU / 256 МБ / без тюнинга | $1-3      | 300-500                        |
+| 1 vCPU / 256 МБ + ulimit/sysctl | $1-3    | 800-1200                       |
+| 1 vCPU / 512 МБ + тюнинг      | $3-5      | 1500-2500                      |
+| 2 vCPU / 1 ГБ + тюнинг        | $5-10     | 5000-8000                      |
+
+Узкое место - RAM (Go runtime + goroutine stacks), не CPU. ChaCha20
+поверх sync.Pool жрёт <1% ядра на сотнях conn/сек. Тюнинг на eле-еле-VPS:
+`ulimit -n 65536` и `sysctl net.netfilter.nf_conntrack_max=131072` -
+сразу 2x потолок.
 
 ## Что в репозитории
 

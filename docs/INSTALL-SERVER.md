@@ -4,12 +4,41 @@
 открытым TCP-портом. Площадка: Hetzner, OVH, Vultr, DO - любой не-RU/CIS
 провайдер, который не обязан отвечать на запросы РКН.
 
-Минимум: 1 vCPU, 512 МБ RAM, 1 ГБ диска. Сервер тянет 1000+
-одновременных клиентов на 1 vCPU: AEAD-копии буфера идут через
-sync.Pool, на горячих аллокациях GC pressure ~10x ниже чем без пула.
-maxConcurrentConns по умолчанию 8192 (запас на reconnect-churn + probe
-storms). Для 1000+ юзеров поставь `ulimit -n 65536` и
-`sysctl -w net.netfilter.nf_conntrack_max=131072` на хосте.
+Минимум **рабочий**: 1 vCPU / 256 МБ RAM / 10 ГБ диска - такие сейчас
+продаются за $1-3/мес у low-end-провайдеров.
+
+**Сколько тянет** (на типичной Matrix-нагрузке /sync long-poll):
+
+- 1 vCPU / 256 МБ, defaults: 300-500 одновременных юзеров.
+  Упирается в `ulimit -n` (по умолчанию 1024 на большинстве дистров).
+- 1 vCPU / 256 МБ + тюнинг ниже: 800-1200.
+- 1 vCPU / 512 МБ + тюнинг: 1500-2500.
+- 2 vCPU / 1 ГБ + тюнинг: 5000-8000.
+
+Узкое место - RAM (Go heap + goroutine stacks), не CPU. AEAD-копии
+буфера идут через sync.Pool, на горячих аллокациях GC pressure ~10x
+ниже чем без пула. maxConcurrentConns по умолчанию 8192 (запас на
+reconnect-churn + probe storms).
+
+**Тюнинг для еле-еле-VPS** (даёт +2-3x потолок):
+
+```bash
+# /etc/security/limits.conf или /etc/systemd/system.conf:
+*   soft   nofile   65536
+*   hard   nofile   65536
+
+# /etc/sysctl.d/99-mxtr.conf:
+net.core.somaxconn = 8192
+net.ipv4.ip_local_port_range = 10000 65535
+net.netfilter.nf_conntrack_max = 131072
+net.ipv4.tcp_max_orphans = 32768
+fs.file-max = 200000
+
+sysctl -p /etc/sysctl.d/99-mxtr.conf
+```
+
+Применить через `docker compose down && docker compose up -d` или
+рестарт VPS.
 
 ## Вариант 1. Docker (рекомендуется)
 
