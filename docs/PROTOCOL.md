@@ -47,8 +47,8 @@ ALPN: server предлагает `h2,http/1.1` (порядок выбирает
 ## Handshake (после TLS)
 
 ```
-Client → Server: nonce_c(16) || padlen_c(1) || pad_c(padlen_c) || mac_c(16)
-Server → Client: nonce_s(16) || padlen_s(1) || pad_s(padlen_s) || mac_s(16)
+Client -> Server: nonce_c(16) || padlen_c(1) || pad_c(padlen_c) || mac_c(16)
+Server -> Client: nonce_s(16) || padlen_s(1) || pad_s(padlen_s) || mac_s(16)
 
   mac_c = HMAC-SHA256(PSK, nonce_c || padlen_c || pad_c || "c2s-hs")[:16]
   mac_s = HMAC-SHA256(PSK, nonce_s || padlen_s || pad_s || "s2c-hs")[:16]
@@ -121,13 +121,13 @@ teardown сессии.
 
 | code | name      | направление    | payload                          |
 |------|-----------|----------------|----------------------------------|
-| 0x01 | OPEN      | client → server| `addr_type(1) || addr || port(2)`|
+| 0x01 | OPEN      | client -> server| `addr_type(1) || addr || port(2)`|
 | 0x02 | DATA      | bidir          | произвольные байты               |
 | 0x03 | CLOSE     | bidir          | пусто                            |
 | 0x04 | PING      | bidir          | случайный padding                |
 | 0x05 | PONG      | bidir          | случайный padding                |
-| 0x06 | OPEN_OK   | server → client| пусто                            |
-| 0x07 | OPEN_ERR  | server → client| utf8-причина                     |
+| 0x06 | OPEN_OK   | server -> client| пусто                            |
+| 0x07 | OPEN_ERR  | server -> client| utf8-причина                     |
 
 `addr_type`:
 
@@ -172,7 +172,7 @@ PSK, restart сохраняет identity):
 
 **Версии скрыты**: только family name, как `server_tokens off` /
 `ServerSignature Off` на реальном production. На каждый probe **статус
-выбирается случайно** из {403, 404, 500} - не пинимый "всегда 500" tell.
+выбирается случайно** из {403, 404, 500} - не статичный "всегда 500" tell.
 
 Path-aware ответы:
 
@@ -209,7 +209,7 @@ HKDF-SHA256(
   10_000 + out[8]*50         -> idle_threshold_ms        (10.0-22.75s)
 ```
 
-Два разных деплоя, разные PSK → разный порядок ALPN, разная cadence
+Два разных деплоя, разные PSK -> разный порядок ALPN, разная cadence
 heartbeat. Pattern-detector, обученный на одном deployment'е, не
 покрывает другой.
 
@@ -231,8 +231,8 @@ crypto/rand на первом startup и **персистится** на дис�
 |-------------------------------------|----------------------------------------------|
 | `curl https://host:<port>/`         | TLS-1.3 + h2 + случайно 403/404/500 одного из 6 семейств, headers совпадают с тем что реально отдаёт это family |
 | `curl https://host:<port>/robots.txt` | TLS-1.3 + h2 + 200 + `User-agent: *\nDisallow:\n` |
-| `nc host <port>` + случайные байты  | TLS-1.3 handshake → дальше hang 60с          |
-| Правильный mxtr-handshake (wrong PSK)| TLS → читает MAC → fail → hang 60с          |
+| `nc host <port>` + случайные байты  | TLS-1.3 handshake -> дальше hang 60с          |
+| Правильный mxtr-handshake (wrong PSK)| TLS -> читает MAC -> fail -> hang 60с          |
 | TLS handshake без SNI               | принимаем, отдаём cert (SNI tolerant)        |
 | TLS handshake с любым SNI           | принимаем, отдаём cert (один cert на listener)|
 

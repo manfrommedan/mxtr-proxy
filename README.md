@@ -2,10 +2,15 @@
 
 Обфусцированный TCP-relay для Matrix-клиентов на matrix-rust-sdk.
 Сервер выглядит для пассивного DPI и активного зондирования как
-неправильно сконфигурированный CDN-edge (Cloudflare / Fastly /
-BunnyCDN-стиль): тот же IP при `curl https://...` отдаёт
-правдоподобную 500-страницу, внутренний протокол неотличим от
-случайного TLS-шума.
+обычный VPS с дефолт-конфигом веб-сервера: `curl https://...` отдаёт
+случайно 403/404/500 от одного из 6 семейств (nginx / Apache /
+LiteSpeed / Caddy / cloudflare / generic), `curl https://.../robots.txt`
+отдаёт реалистичный 200 с `User-agent: *\nDisallow:\n`. Семейство и
+cert CN (~1.8 млн вариантов из реальных CDN-namespace) выбираются на
+первом старте и персистятся - restart identity не меняет, как у
+настоящего nginx. Внутренний протокол после TLS неотличим от
+случайного шума: AEAD-фреймы с 13-rung PADME-паддингом + size-scaled
+bump, гистограмма размеров размазана по 13 buckets без spike'ов.
 
 Создавался под форк Element X+ (наш Android-клиент Matrix). Это **не**
 general-purpose-прокси, **не** замена VPN, **не** конкурент MTProto.
@@ -41,7 +46,7 @@ long-poll + редкие burst'ы):
 
 Одной строкой на VPS (Docker required). Замени `<vps-ip>` на свой публичный
 IPv4 и `<port>` на любой свободный порт (примеры ниже используют `<port>` как
-placeholder — выбирай нестандартный, не 443/80/22):
+placeholder - выбирай нестандартный, не 443/80/22):
 
 ```bash
 docker run -d --name mxtr-proxy --restart unless-stopped --network host \
@@ -56,7 +61,7 @@ sleep 2 && docker logs mxtr-proxy 2>&1 | grep share-string
 запуске генерится и пишется в `/state/psk.hex` (`chmod 600`); cert CN +
 cloak family тоже персистятся туда же, рестарт identity сохраняет.
 
-Вставить в `Настройки → Расширенные → АнтиЦензурный прокси` в форке
+Вставить в `Настройки -> Расширенные -> АнтиЦензурный прокси` в форке
 Element X+, перезапустить app, готово.
 
 Не забудь открыть порт: `ufw allow <port>/tcp` (или
@@ -75,7 +80,8 @@ PSK, target-allowlist, compose, LE-сертификат) - см.
   Android-клиент на matrix-rust-sdk. Что копировать, куда вешать
   hooks.
 - [PROTOCOL.md](docs/PROTOCOL.md) - wire-формат: TLS, handshake,
-  AEAD-фреймы, stream-мультиплексирование, camouflage 500, per-PSK
+  AEAD-фреймы, stream-мультиплексирование, camouflage HTTP (6 семейств,
+  random 403/404/500, path-aware /robots.txt, persisted identity), per-PSK
   config.
 - [THREAT-MODEL.md](docs/THREAT-MODEL.md) - от кого защищает (пассивный
   DPI, активное зондирование, утечка PSK, IP-блокировка), и чего НЕ умеет
@@ -90,19 +96,26 @@ PSK, target-allowlist, compose, LE-сертификат) - см.
   старый трафик не расшифровывает: AEAD-ключи привязаны к nonce,
   которые внутри outer-TLS, без TLS-ключей их не достать.
 - ТСПУ не банит «класс mxtr-серверов» одним правилом. PSK через HKDF
-  выводит свою camouflage server-family (nginx / Apache / LiteSpeed),
-  порядок ALPN и cadence heartbeat - у каждого деплоя свой fingerprint.
+  выводит порядок ALPN и cadence heartbeat. Cloak family (одно из 6:
+  nginx/Apache/LiteSpeed/Caddy/cloudflare/Go-stdlib) и cert CN
+  (синтетический из ~1.8 млн CDN-edge-namespace) выбираются на первом
+  старте и персистятся - у каждого деплоя свой fingerprint, restart
+  не меняет identity.
 - Полная децентрализация. Нет центрального сервера, нет публичных
   списков IP, нет CDN-точки отказа. Каждый поднимает свой VPS, сам
   раздаёт share-string своему кругу. РКН нечего блокировать оптом -
   только заходить per-IP, а они между собой ничем не связаны.
 - Устойчив к зондированию: `curl https://<vps-ip>:<port>/` отдаёт
   случайно-выбранную 403/404/500-страницу одного из 6 семейств
-  (nginx/Apache/LiteSpeed/Caddy/Cloudflare/Go-stdlib) с пинной
-  Server-header (без версии) и текущим `Date:`. Семейство и cert CN
-  выбираются один раз и персистятся — restart не меняет identity.
-  Не-HTTP байты висят 60 секунд. Зонд не получает ни одного
-  положительного сигнала.
+  (nginx/Apache/LiteSpeed/Caddy/Cloudflare/Go-stdlib) с family-specific
+  headers (HSTS у Caddy, Cache-Control+Vary у Cloudflare и т.д.) без
+  светящихся версий. `/robots.txt` отвечает 200 c `User-agent: *\nDisallow:\n`
+  как реальный public-facing сервер - статичный 500-на-всё (что делает
+  большинство простых cloak'ов) сам по себе tell. Cloak family
+  и cert CN выбраны один раз и персистятся, restart identity не
+  меняет (real nginx тоже не меняет 500-страницу при рестарте).
+  Не-HTTP байты висят 60 секунд. Зонд не получает положительного
+  сигнала ни на одном пути.
 - Один long-lived TLS-сокет на всю сессию, N параллельных потоков
   внутри (stream mux). Handshake платится один раз, дальше /sync,
   /messages, /upload идут поверх.
@@ -128,16 +141,18 @@ PSK, target-allowlist, compose, LE-сертификат) - см.
   [INTEGRATE-ANDROID.md](docs/INTEGRATE-ANDROID.md), но руками.
 - Не shared-сервис в смысле multi-tenancy: один PSK на деплой. Но
   1000+ пользователей под одним PSK на одной VPS - норма.
-- Оверхед по трафику есть: 16 байт AEAD-tag на фрейм + power-of-2
-  padding (обфускация размеров стоит обычно 30-50% поверх payload).
+- Оверхед по трафику есть: 16 байт AEAD-tag на фрейм + PADME-style
+  13-rung padding с size-scaled bump (обфускация размеров стоит ~10-25%
+  поверх payload, заметно меньше чем pure power-of-2 у предыдущих версий).
   На LTE заметно, на Wi-Fi нет.
 - Нет TCP-splice до реального cloak-домена (как у `telemt`). Для
   личного использования (свой VPS, свой круг, обход цензуры и
   чебурнета без публичной светимости) - избыточно. РКН и иранский
   чебурнет активно обходят публичные шеренги proxy-IP; у нас IP
   знают только те, кому ты сам выдал share-string. Массовых
-  зондирований по такому IP не будет, синтетической 500-страницы
-  хватает закрыть случайного зеваку.
+  зондирований по такому IP не будет, синтетического cloak'а
+  (рандомизированные 403/404/500 + path-aware /robots.txt + persisted
+  identity) хватает закрыть случайного зеваку.
 
 ## Совместимость
 

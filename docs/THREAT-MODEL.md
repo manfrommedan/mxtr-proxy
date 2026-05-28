@@ -57,21 +57,21 @@ TLS-handshake без полезных данных, или как попытка
 |-------------------------------------|------------------------------------------------|
 | `curl https://host:<port>/`         | TLS-1.3 + случайно 403/404/500 одного из 6 семейств + family-specific headers и body |
 | `curl https://host:<port>/robots.txt` | TLS-1.3 + 200 + `User-agent: *\nDisallow:\n` |
-| `nc host <port>` + случайные байты  | TLS-handshake → дальше hang 60 секунд          |
-| Telnet до timeout                   | пустой TLS-handshake → drop                    |
-| Правильный handshake, неверный PSK  | TLS → mxtr handshake → HMAC fail → hang 60с    |
+| `nc host <port>` + случайные байты  | TLS-handshake -> дальше hang 60 секунд          |
+| Telnet до timeout                   | пустой TLS-handshake -> drop                    |
+| Правильный handshake, неверный PSK  | TLS -> mxtr handshake -> HMAC fail -> hang 60с    |
 
 **Защита**:
 
 - 6 шаблонов 500-страниц (nginx, Apache, LiteSpeed, Caddy, cloudflare,
   Go-stdlib), один выбирается на первом старте и **сохраняется** -
   Server-header consistent across requests/restarts. На каждый
-  отдельный probe **статус случайный** из {403, 404, 500} - не пинимый
+  отдельный probe **статус случайный** из {403, 404, 500} - не статичный
   "всегда 500" tell. Версии в Server header не показываем (matches
   `server_tokens off` / `ServerSignature Off` на реальном production).
 - Path-aware ответы. `/robots.txt` - 200 с реалистичным телом, как у
-  любого public-facing HTTP-сервера. Pinned 500-on-everything (то что
-  делает большинство простых cloak'ов) - tell.
+  любого public-facing HTTP-сервера. Статичное 500-на-всё (что делает
+  большинство простых cloak'ов) - tell.
 - 60-секундный hang при невалидных байтах **И** при HMAC-fail - один
   зондирующий запрос занимает fd на минуту, для massive scanning
   стоимость растёт линейно.

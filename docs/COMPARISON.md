@@ -62,8 +62,8 @@ obfuscation mode. fake-TLS-реализация не менялась струк
 
 - tdesktop: коммит [`407bf19`](https://github.com/telegramdesktop/tdesktop/commit/407bf196417b80c903f6ae65d4c3202be72286d5)
   ([PR #30513](https://github.com/telegramdesktop/tdesktop/pull/30513)),
-  2026-04-03 - extension `0xfe02 → 0xfe0d` (под ECH draft ID),
-  `Op::random(20) → Op::random(32)`.
+  2026-04-03 - extension `0xfe02 -> 0xfe0d` (под ECH draft ID),
+  `Op::random(20) -> Op::random(32)`.
 - Telegram Android: [PR DrKLO/Telegram #1949](https://github.com/DrKLO/Telegram/pull/1949)
   (`37708d4`), Google Play 2026-04-06.
 - iOS - в то же окно.
@@ -147,7 +147,7 @@ production `server_tokens off`/`ServerSignature Off`.
 
 Path-aware: `/robots.txt` отвечает 200 с реалистичным телом
 `User-agent: *\nDisallow:\n`. Real CDN edge всегда так делает на
-public-facing порту, а pinned 500-on-everything - tell.
+public-facing порту, а статичное 500-на-всё - tell.
 
 `curl -ksv https://<vps-ip>:<port>/` от зеваки даёт случайно
 выбранный 4xx/5xx правдоподобной структуры. Если зондирование
@@ -255,7 +255,7 @@ alexbers/mtprotoproxy умеет 1 порт = N secrets. Это пока в road
 
 - **Nested-TLS fingerprint** (Xue et al., USENIX Security 2024) - если
   внутри обфусцированного транспорта летит ещё одна TLS-сессия (как у
-  нас в OIDC: WebView → mxtr → TLS до IdP), вложенный handshake
+  нас в OIDC: WebView -> mxtr -> TLS до IdP), вложенный handshake
   оставляет timing/byte-pattern. MTProxy тоже подвержен, когда клиент
   гоняет TLS поверх MTProxy.
 - **Cross-layer RTT distinguishing** (Xue et al., NDSS 2025, DOI
@@ -266,7 +266,9 @@ alexbers/mtprotoproxy умеет 1 порт = N secrets. Это пока в road
 - **Probe-resistant proxy detection** (Frolov et al., NDSS 2020) -
   timeout + byte threshold распознают proxies, которые молчат при
   невалидном зонде. MTProxy уязвим, mxtr частично компенсируется
-  camouflage 500, но не до конца.
+  camouflage HTTP (6 семейств, random 403/404/500, path-aware /robots.txt
+  отвечает 200) - но не до конца, активный probe всё равно может различить
+  статичный-camouflage от реального CDN edge.
 
 ## Сводная таблица
 
@@ -276,7 +278,7 @@ alexbers/mtprotoproxy умеет 1 порт = N secrets. Это пока в road
 | Серверный язык / runtime | C (offic.) / Go (mtg) / Rust+Tokio (telemt) / Python (alexbers) | Go |
 | Стейт серверного code-base | официальный заброшен Telegram, живут форки | актив |
 | Outer layer | fake-TLS (имитация) | настоящий TLS-1.3 |
-| Ответ на зондирование | timeout / hang (offic., alexbers) → real TLS splice (telemt) | случайно 403/404/500 одного из 6 семейств + path-aware /robots.txt=200 |
+| Ответ на зондирование | timeout / hang (offic., alexbers) -> real TLS splice (telemt) | случайно 403/404/500 одного из 6 семейств + path-aware /robots.txt=200 |
 | Cert subject | один на весь deploy | synthetic из ~1.8M space, persisted per host |
 | SNI tracking | не явно адресовано | SNI=cert subject в share-string, no domain-fronting tell |
 | Stream mux | нет | да |
