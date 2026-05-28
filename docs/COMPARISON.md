@@ -117,7 +117,8 @@ mxtr из PSK через HKDF выводит:
 - camouflage family - один из 6 (nginx/Apache/LiteSpeed/Caddy/cloudflare/Go-stdlib),
   выбирается crypto/rand на первом запуске и сохраняется в файл
   рядом с PSK. Restart сохраняет identity (реальный nginx тоже не меняет
-  500-страницу при рестарте, перевыбор - сам по себе tell).
+  500-страницу при рестарте, ротация identity на каждый запуск -
+  сама по себе признак подмены).
 - TLS cert CN - синтетический CDN-edge name из ~1.8 млн комбинаций
   (60 cities × 7 CDN patterns × 99 number positions), персистится.
   Restart не меняет subject - cert тоже выглядит стабильным.
@@ -147,7 +148,7 @@ production `server_tokens off`/`ServerSignature Off`.
 
 Path-aware: `/robots.txt` отвечает 200 с реалистичным телом
 `User-agent: *\nDisallow:\n`. Real CDN edge всегда так делает на
-public-facing порту, а статичное 500-на-всё - tell.
+public-facing порту, и мы тоже отвечаем.
 
 `curl -ksv https://<vps-ip>:<port>/` от зеваки даёт случайно
 выбранный 4xx/5xx правдоподобной структуры. Если зондирование
@@ -179,7 +180,7 @@ bump**: для payload <1KB с 30% шансом padder прыгает на сл�
 фреймах. Bump-решение делается independently на каждой стороне (wire
 видит только зашифрованную длину) - синхронизировать не нужно.
 
-### 6. SNI совпадает с cert (anti-domain-fronting tell)
+### 6. SNI совпадает с cert (избегаем признака domain fronting)
 
 TSPU с 2022 активно отслеживает "SNI≠ServerHello.cert.subject" -
 классический паттерн domain fronting. mxtr **специально избегает**:
@@ -188,7 +189,7 @@ generated cert CN. Клиент шлёт этот hostname в ClientHello, се�
 представляет cert с тем же subject. Согласованно.
 
 Кроме того mxtr не шлёт **пустой SNI** или **IP-литерал в SNI**: оба
-эти варианта - сильный tell (90%+ реального HTTPS-трафика SNI шлёт
+эти варианта - яркое палево (90%+ реального HTTPS-трафика SNI шлёт
 нормальным hostname'ом, "TLS без SNI на VPS" моментально
 маркируется ML как probable proxy). Без `?sni=` в share-string fall
 back на IP - но это режим, когда оператор сам решил пожертвовать
@@ -200,7 +201,7 @@ back на IP - но это режим, когда оператор сам реш
 
 | Свойство | MTProxy (mtg v2 / telemt) | mxtr |
 |---|---|---|
-| Domain fronting (cloak host) | да | **намеренно нет** (SNI≠cert это TSPU-tracked tell) |
+| Domain fronting (cloak host) | да | **намеренно нет** (SNI≠cert это признак, который ТСПУ отслеживает) |
 | Transparent TCP splice до реального сайта | telemt - да | нет |
 | Forward secrecy на уровне PSK | нет | нет |
 | Per-conn PSK rotation | нет | нет |
@@ -280,7 +281,7 @@ alexbers/mtprotoproxy умеет 1 порт = N secrets. Это пока в road
 | Outer layer | fake-TLS (имитация) | настоящий TLS-1.3 |
 | Ответ на зондирование | timeout / hang (offic., alexbers) -> real TLS splice (telemt) | случайно 403/404/500 одного из 6 семейств + path-aware /robots.txt=200 |
 | Cert subject | один на весь deploy | synthetic из ~1.8M space, persisted per host |
-| SNI tracking | не явно адресовано | SNI=cert subject в share-string, no domain-fronting tell |
+| SNI tracking | не явно адресовано | SNI=cert subject в share-string, нет признака domain fronting |
 | Stream mux | нет | да |
 | Padding | случайный +0..15B (mtg) | 13-rung PADME ladder + size-scaled bump (30/18/8%) |
 | Domain fronting / cloak | mtg v2 + telemt - да | намеренно нет |

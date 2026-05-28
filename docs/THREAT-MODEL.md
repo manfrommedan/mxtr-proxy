@@ -23,17 +23,26 @@ HTTPS-трафика.
 - Per-host persisted identity: cloak family (один из 6: nginx, Apache,
   LiteSpeed, Caddy, cloudflare, Go-stdlib) и cert CN выбираются один
   раз и сохраняются на диск. Restart не меняет identity - реальный
-  nginx тоже не меняет 500-страницу при рестарте. Перевыбор identity на
-  каждом startup - сам по себе tell.
+  nginx тоже не меняет 500-страницу при рестарте. Если бы identity
+  менялась на каждый startup, это само по себе выдало бы что сервер
+  не настоящий.
 - 13-rung PADME padding ladder + size-scaled probabilistic bump
   (30/18/8% для <1KB/<4KB/>=4KB). Размеры данных размазаны по 13 buckets,
   гистограмма не имеет острых spike'ов.
 - Random padding в handshake. Первый пакет после TLS не имеет
   фиксированной длины (1-256 байт padding).
-- PING-PONG jitter 0-15ms. Убит "every PING matched by PONG within 1ms"
-  timing tell, который читает flow-shape ML.
-- SNI совпадает с cert subject - нет "domain fronting tell"
-  (SNI≠cert subject - то что TSPU активно отслеживает с 2022).
+- PING-PONG jitter 0-15ms. Убит тайминговый признак "каждый PING
+  возвращает PONG в пределах 1мс", который flow-shape ML моментально
+  замечает на любом реальном TCP-потоке: настоящие сервисы так быстро
+  не отвечают - всегда есть процессинг.
+- SNI совпадает с cert subject - нет признака domain fronting.
+  Domain fronting это когда клиент шлёт в ClientHello SNI одного
+  популярного домена, а cert приходит на совсем другой - паттерн
+  старых обходов цензуры. ТСПУ научилось отслеживать этот
+  раскоррелированный сигнал с 2022, такие соединения режутся
+  быстрее обычных. Мы шлём в SNI ровно то же, что у cert subject, и
+  оба - синтетический CDN-edge hostname, выглядим как обычный
+  одиночный VPS на дефолт-cert'е.
 
 **Чего не делает**: GREASE-extensions в TLS-1.3. Чистая Java TLS-1.3 без
 GREASE на фоне Chrome выделяется (Chrome всегда добавляет GREASE). На
@@ -66,12 +75,17 @@ TLS-handshake без полезных данных, или как попытка
 - 6 шаблонов 500-страниц (nginx, Apache, LiteSpeed, Caddy, cloudflare,
   Go-stdlib), один выбирается на первом старте и **сохраняется** -
   Server-header consistent across requests/restarts. На каждый
-  отдельный probe **статус случайный** из {403, 404, 500} - не статичный
-  "всегда 500" tell. Версии в Server header не показываем (matches
-  `server_tokens off` / `ServerSignature Off` на реальном production).
-- Path-aware ответы. `/robots.txt` - 200 с реалистичным телом, как у
-  любого public-facing HTTP-сервера. Статичное 500-на-всё (что делает
-  большинство простых cloak'ов) - tell.
+  отдельный probe **статус случайный** из {403, 404, 500}. Каждый
+  ответ family-specific: со своими headers (`Cache-Control` у
+  Cloudflare, `Strict-Transport-Security` у Caddy, `Connection: close`
+  у nginx, и т.д.) и со своим телом - 500-страница у нас не разовая
+  заглушка, а полноценный камуфляж под выбранное семейство. Версии
+  в Server header не показываем (как `server_tokens off` /
+  `ServerSignature Off` на реальном production).
+- Path-aware ответы. `/robots.txt` отвечает 200 с реалистичным телом
+  `User-agent: *\nDisallow:\n` - как у любого public-facing HTTP-сервера.
+  Остальные пути идут через рандомизатор 403/404/500. Разные пути -
+  разные ответы, как у реального веб-сервера.
 - 60-секундный hang при невалидных байтах **И** при HMAC-fail - один
   зондирующий запрос занимает fd на минуту, для massive scanning
   стоимость растёт линейно.

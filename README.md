@@ -110,8 +110,7 @@ PSK, target-allowlist, compose, LE-сертификат) - см.
   (nginx/Apache/LiteSpeed/Caddy/Cloudflare/Go-stdlib) с family-specific
   headers (HSTS у Caddy, Cache-Control+Vary у Cloudflare и т.д.) без
   светящихся версий. `/robots.txt` отвечает 200 c `User-agent: *\nDisallow:\n`
-  как реальный public-facing сервер - статичный 500-на-всё (что делает
-  большинство простых cloak'ов) сам по себе tell. Cloak family
+  как реальный public-facing сервер. Cloak family
   и cert CN выбраны один раз и персистятся, restart identity не
   меняет (real nginx тоже не меняет 500-страницу при рестарте).
   Не-HTTP байты висят 60 секунд. Зонд не получает положительного

@@ -243,8 +243,16 @@ curl --socks5 127.0.0.1:1984 https://matrix.org/_matrix/client/versions
   на разных портах или IP.
 - Не лимитит per-IP. Поставь `iptables --hashlimit` или nginx-фронт
   если нужен публичный shared-сервис.
-- Не делает domain fronting. DPI-resistance держится на synthetic CN +
-  camouflage HTTP + SNI совпадает с cert. Domain fronting (SNI≠cert) -
-  это классический tell, мы его специально избегаем.
+- Не делает domain fronting. Domain fronting - это когда клиент шлёт
+  в TLS ClientHello SNI=`<популярный-домен>` (например, `cloudflare.com`),
+  а сервер за ним отдаёт cert на совсем другой домен. Идея в том чтобы
+  пассивный DPI считал что соединение идёт к популярному домену и не
+  блокировал. Проблема: РКН ТСПУ с 2022 года активно ищет именно этот
+  паттерн "SNI не совпадает с cert subject" - и режет такие соединения
+  быстрее обычных. Мы намеренно делаем наоборот: SNI=cert subject, оба -
+  наш synthetic CDN-edge hostname. Снаружи это выглядит как обычный
+  мелкий VPS с дефолт-cert nginx на своём собственном hostname - тех
+  миллионы. DPI-устойчивость держится не на маскировке под чужой домен,
+  а на synthetic CN из ~1.8M space + camouflage HTTP + persisted identity.
 - Не экспортит метрики и не телеметрит. Никаких outbound-соединений,
   кроме тех, что инициировал клиент через CONNECT.

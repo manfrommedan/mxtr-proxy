@@ -172,7 +172,7 @@ PSK, restart сохраняет identity):
 
 **Версии скрыты**: только family name, как `server_tokens off` /
 `ServerSignature Off` на реальном production. На каждый probe **статус
-выбирается случайно** из {403, 404, 500} - не статичный "всегда 500" tell.
+выбирается случайно** из {403, 404, 500} - не статичный "всегда 500", который сам по себе выдаёт подделку.
 
 Path-aware ответы:
 
@@ -222,7 +222,7 @@ crypto/rand на первом startup и **персистится** на дис�
 **Handshake jitter** (5-50 мс на server-hello): фиксированные константы
 `jitterMinMS`/`jitterMaxMS`. Отдельно есть **PING-PONG jitter** 0-15 мс:
 сервер отвечает PONG с дополнительной случайной задержкой через goroutine,
-чтобы убить "every PING matched by PONG within 1ms" timing tell, который
+чтобы убить тайминговый признак "каждый PING получает PONG в пределах 1мс", который
 читает flow-shape ML.
 
 ## Активный зонд: что увидит
@@ -277,7 +277,8 @@ identity.
   GREASE отдаёт - но не на всех версиях ровно.
 - Не делает domain fronting через CDN. Камуфляж - synthetic CN +
   camouflage HTTP + persisted identity. SNI совпадает с cert: domain
-  fronting (SNI≠cert) - **классический tell**, мы его избегаем.
+  fronting (SNI≠cert) - **классический признак**, который ТСПУ
+  читает с 2022, мы его избегаем.
 - Не делает TCP-splice cloak до реального сайта (как `telemt`). Для
   personal-VPS избыточно.
 - Не имеет congestion-control сверх TCP. Один сокет = одно окно. При
