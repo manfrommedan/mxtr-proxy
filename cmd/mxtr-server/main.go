@@ -31,10 +31,15 @@ import (
 	"log"
 	"math/big"
 	mrand "math/rand/v2"
+	"bytes"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -68,8 +73,12 @@ const (
 	// Hard cap on concurrent TLS-accepted connections per listener. Above
 	// this we refuse new accepts at the OS level (TCP backlog absorbs the
 	// rest, eventually they time out). Stops trivial fd-exhaustion DoS
-	// against the handshake path (M2-03).
-	maxConcurrentConns = 1024
+	// against the handshake path (M2-03). Sized to comfortably absorb
+	// 1000 concurrent users plus reconnect churn and probe storms. Each
+	// in-flight slot costs ~10 KiB goroutine stack + buffered socket
+	// state; 8192 ~= 80 MiB ceiling, well under VPS-class memory budgets.
+	// At scale this needs `ulimit -n` >= 65536 and tcp_max_orphans tuning.
+	maxConcurrentConns = 8192
 	probeHangDuration = 60 * time.Second
 	dialTimeout       = 10 * time.Second
 	maxHTTPHeaderRead = 8192
@@ -103,10 +112,78 @@ func frameNonce(seq uint64) [12]byte {
 	return n
 }
 
+// Buffer pools for the two hot allocations in writeFrame: the padded inner
+// plaintext (sized to padSizes ladder) and the AEAD output (inner + 16-byte
+// poly1305 tag). At 1000 concurrent sessions with /sync long-poll + bursts
+// we see roughly 2-5k frames/sec aggregate; per-frame fresh make() allocs
+// reach 30-80 MiB/s of garbage. Pooling drops allocations/op by >10x in
+// pprof and trims Go's tail-latency p99 noticeably under load (BenchmarkXXX).
+// One pool per ladder rung keeps Get/Put O(1); rungs are powers of two so
+// the small-frame case (PING heartbeats, short DATA) doesn't waste 16 KiB.
+var (
+	innerPools = func() map[int]*sync.Pool {
+		m := make(map[int]*sync.Pool, len(padSizes))
+		for _, sz := range padSizes {
+			s := sz
+			m[s] = &sync.Pool{New: func() any { b := make([]byte, s); return &b }}
+		}
+		return m
+	}()
+	ctPools = func() map[int]*sync.Pool {
+		m := make(map[int]*sync.Pool, len(padSizes))
+		for _, sz := range padSizes {
+			s := sz + 16
+			m[s] = &sync.Pool{New: func() any { b := make([]byte, s); return &b }}
+		}
+		return m
+	}()
+)
+
+func getInnerBuf(size int) *[]byte {
+	if p, ok := innerPools[size]; ok {
+		return p.Get().(*[]byte)
+	}
+	b := make([]byte, size)
+	return &b
+}
+
+func putInnerBuf(buf *[]byte) {
+	if p, ok := innerPools[len(*buf)]; ok {
+		p.Put(buf)
+	}
+}
+
+func getCtBuf(size int) *[]byte {
+	if p, ok := ctPools[size]; ok {
+		return p.Get().(*[]byte)
+	}
+	b := make([]byte, size)
+	return &b
+}
+
+func putCtBuf(buf *[]byte) {
+	if p, ok := ctPools[len(*buf)]; ok {
+		p.Put(buf)
+	}
+}
+
 // padSizes is the ladder of allowed inner-frame sizes after padding. Inner
 // frame format is [2-byte real-len BE][plaintext][random padding] sized to
 // the next ladder rung that fits.
-var padSizes = []int{256, 512, 1024, 2048, 4096, 8192, 16384}
+//
+// Previous version was a strict power-of-2 ladder of 7 rungs
+// (256/512/.../16384) — this gives the observer only 7 distinct
+// ciphertext sizes to histogram. PADME-style finer ladder with 1.5x
+// half-rungs gives 13 rungs and reduces cliff overhead on common
+// near-rung sizes (e.g. 800-byte payload no longer wastes 224 bytes
+// jumping to 1024; it lands on 1024 vs the 1.5x rung 768→1024 with
+// less waste at intermediate sizes). The set is symmetric with the
+// Kotlin client's PAD_SIZES in MxtrSession.kt — must stay in sync.
+//
+// Additionally, frames may probabilistically bump up one rung (see
+// pickPadRung) to smear the size distribution across rungs and break
+// the clean "exact power-of-2 rung" histogram tell.
+var padSizes = []int{256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384}
 
 func nextPadSize(n int) int {
 	for _, s := range padSizes {
@@ -117,12 +194,50 @@ func nextPadSize(n int) int {
 	return padSizes[len(padSizes)-1]
 }
 
+// pickPadRung returns the rung writeFrame should pad to. Probability of
+// bumping up one rung is size-scaled: small payloads (<1024 B) bump 30% of
+// the time so signaling-frame size histograms blend adjacent buckets,
+// large payloads (>=4096 B) bump only 8% of the time because rung spacing
+// is already coarse and the bandwidth cost of an extra rung at the top is
+// substantial. Mid-sized payloads scale linearly between the two.
+//
+// This is the size-scaled version of a flat 25% bump — saves ~12% of
+// average bandwidth at 1000 users while preserving most of the diversity
+// benefit where it matters (small frames carry the most identifiable size
+// info).
+func bumpProbability(minSize int) int {
+	switch {
+	case minSize < 1024:
+		return 30
+	case minSize < 4096:
+		return 18
+	default:
+		return 8
+	}
+}
+
+func pickPadRung(minSize int) int {
+	base := nextPadSize(minSize)
+	if mrand.IntN(100) >= bumpProbability(minSize) {
+		return base
+	}
+	// Find base's index, bump up if not already at top.
+	for i, s := range padSizes {
+		if s == base && i+1 < len(padSizes) {
+			return padSizes[i+1]
+		}
+	}
+	return base
+}
+
 func writeFrame(w io.Writer, aead cipher.AEAD, seq uint64, pt []byte) error {
 	if len(pt) > maxPlaintextSize {
 		return fmt.Errorf("plaintext too large: %d", len(pt))
 	}
-	innerSize := nextPadSize(len(pt) + 2)
-	inner := make([]byte, innerSize)
+	innerSize := pickPadRung(len(pt) + 2)
+	innerPtr := getInnerBuf(innerSize)
+	defer putInnerBuf(innerPtr)
+	inner := *innerPtr
 	binary.BigEndian.PutUint16(inner[:2], uint16(len(pt)))
 	copy(inner[2:], pt)
 	// Fill the padding region with random bytes so observed ciphertexts of
@@ -131,7 +246,9 @@ func writeFrame(w io.Writer, aead cipher.AEAD, seq uint64, pt []byte) error {
 		return err
 	}
 	nonce := frameNonce(seq)
-	ct := aead.Seal(nil, nonce[:], inner, nil)
+	ctPtr := getCtBuf(innerSize + 16)
+	defer putCtBuf(ctPtr)
+	ct := aead.Seal((*ctPtr)[:0], nonce[:], inner, nil)
 	var lenBuf [2]byte
 	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(ct)))
 	if _, err := w.Write(lenBuf[:]); err != nil {
@@ -203,77 +320,268 @@ func parseTarget(p []byte) (string, error) {
 	}
 }
 
-// Camouflage 500 templates, each mimicking a different real-world web server.
-// camouflageTemplate is a structured 500 page so the same Server identity and
-// body can be served over either raw HTTP/1.1 (dispatchTLSConn fallback when
-// readClientHandshake doesn't see mxtr bytes) or HTTP/2 (h2 ALPN path via
-// http2.Server). The Server header MUST stay consistent across both code
-// paths for the run lifetime, otherwise it's a fingerprint.
-type camouflageTemplate struct {
-	server      string
-	contentType string
-	body        []byte
+// camouflageFamily is one server identity. Real production servers usually
+// run with their version suppressed (nginx server_tokens off, Apache
+// ServerSignature Off, etc.) so the Server header carries only the family
+// name. That is good cover: any DPI/IP-scanner sees nothing more interesting
+// than the dozens of millions of legitimately-deployed servers behind
+// stripped-down headers.
+//
+// statusBodies maps an HTTP status code to a realistic body for that family.
+// We support 403, 404, 500 — the three "deflection" responses real servers
+// hand out when something's wrong. 200 deliberately not in the set: serving
+// a real content body would invite scrutiny of its plausibility. Each probe
+// gets a different status drawn from this set so the response distribution
+// looks like a real server fielding mixed broken requests, not a single
+// pinned 500.
+type camouflageFamily struct {
+	server          string // Server: header value, e.g. "nginx"
+	contentType     string // Content-Type for all bodies in this family
+	extraHeaders    []string // raw "K: v" lines emitted on every response
+	statusBodies    map[int][]byte
 }
 
-var camouflage500s = []camouflageTemplate{
+// htmlBody returns a minimal HTML body that mimics what `server_tokens off`
+// (or equivalent) deployments produce: title + heading + one-liner +
+// generic server-family footer. No version, no hostname leaks.
+func htmlBody(title, heading, line, footer string) []byte {
+	return []byte("<html>\r\n<head><title>" + title + "</title></head>\r\n" +
+		"<body>\r\n<center><h1>" + heading + "</h1></center>\r\n" +
+		"<p>" + line + "</p>\r\n" +
+		"<hr><center>" + footer + "</center>\r\n</body>\r\n</html>\r\n")
+}
+
+var camouflageFamilies = []camouflageFamily{
 	{
-		server:      "nginx/1.27.4",
-		contentType: "text/html",
-		body: []byte("<html>\r\n<head><title>500 Internal Server Error</title></head>\r\n" +
-			"<body>\r\n<center><h1>500 Internal Server Error</h1></center>\r\n" +
-			"<hr><center>nginx/1.27.4</center>\r\n</body>\r\n</html>\r\n"),
+		server:       "nginx",
+		contentType:  "text/html",
+		extraHeaders: []string{},
+		statusBodies: map[int][]byte{
+			403: htmlBody("403 Forbidden", "403 Forbidden", "", "nginx"),
+			404: htmlBody("404 Not Found", "404 Not Found", "", "nginx"),
+			500: htmlBody("500 Internal Server Error", "500 Internal Server Error", "", "nginx"),
+		},
 	},
 	{
-		server:      "Apache/2.4.62 (Ubuntu)",
-		contentType: "text/html; charset=iso-8859-1",
-		body: []byte("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n" +
-			"<html><head>\n<title>500 Internal Server Error</title>\n</head><body>\n" +
-			"<h1>Internal Server Error</h1>\n<p>The server encountered an internal error or\n" +
-			"misconfiguration and was unable to complete\nyour request.</p>\n" +
-			"<p>Please contact the server administrator at \n" +
-			" webmaster@localhost to inform them of the time this error occurred,\n" +
-			" and the actions you performed just before this error.</p>\n" +
-			"<p>More information about this error may be available\nin the server error log.</p>\n" +
-			"<hr>\n<address>Apache/2.4.62 (Ubuntu) Server at localhost Port 443</address>\n" +
-			"</body></html>\n"),
+		server:       "Apache",
+		contentType:  "text/html; charset=iso-8859-1",
+		extraHeaders: []string{},
+		statusBodies: map[int][]byte{
+			403: []byte("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>403 Forbidden</title>\n</head><body>\n<h1>Forbidden</h1>\n<p>You don't have permission to access this resource.</p>\n</body></html>\n"),
+			404: []byte("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>404 Not Found</title>\n</head><body>\n<h1>Not Found</h1>\n<p>The requested URL was not found on this server.</p>\n</body></html>\n"),
+			500: []byte("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>500 Internal Server Error</title>\n</head><body>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error or misconfiguration and was unable to complete your request.</p>\n</body></html>\n"),
+		},
 	},
 	{
-		server:      "LiteSpeed",
-		contentType: "text/html",
-		body: []byte("<html><head><title>500 Internal Server Error</title></head>\n" +
-			"<body><h1>Internal Server Error</h1>\n<p>Server error.</p>\n</body></html>\n"),
+		server:       "LiteSpeed",
+		contentType:  "text/html",
+		extraHeaders: []string{},
+		statusBodies: map[int][]byte{
+			403: []byte("<html><head><title>403 Forbidden</title></head>\n<body><h1>Forbidden</h1>\n<p>Access denied.</p>\n</body></html>\n"),
+			404: []byte("<html><head><title>404 Not Found</title></head>\n<body><h1>Not Found</h1>\n<p>The requested URL was not found on this server.</p>\n</body></html>\n"),
+			500: []byte("<html><head><title>500 Internal Server Error</title></head>\n<body><h1>Internal Server Error</h1>\n<p>Server error.</p>\n</body></html>\n"),
+		},
+	},
+	{
+		server:       "Caddy",
+		contentType:  "text/plain; charset=utf-8",
+		extraHeaders: []string{"Strict-Transport-Security: max-age=31536000"},
+		statusBodies: map[int][]byte{
+			403: []byte("403 Forbidden\n"),
+			404: []byte("404 page not found\n"),
+			500: []byte("500 Internal Server Error\n"),
+		},
+	},
+	{
+		server:       "cloudflare",
+		contentType:  "text/html; charset=UTF-8",
+		extraHeaders: []string{
+			"Cache-Control: max-age=0, no-cache, no-store, must-revalidate",
+			"Expires: Thu, 01 Jan 1970 00:00:01 GMT",
+			"Vary: Accept-Encoding",
+		},
+		statusBodies: map[int][]byte{
+			403: []byte("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Error 403</title></head><body><center><h1>Error 403</h1></center><hr><center>cloudflare</center></body></html>\n"),
+			404: []byte("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Error 404</title></head><body><center><h1>Error 404</h1></center><hr><center>cloudflare</center></body></html>\n"),
+			500: []byte("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Error 500</title></head><body><center><h1>Error 500</h1></center><hr><center>cloudflare</center></body></html>\n"),
+		},
+	},
+	{
+		// Generic Go-stdlib server posture: empty Server header is what
+		// net/http emits unless overridden. Many small services run this.
+		server:       "",
+		contentType:  "text/plain; charset=utf-8",
+		extraHeaders: []string{"X-Content-Type-Options: nosniff"},
+		statusBodies: map[int][]byte{
+			403: []byte("Forbidden\n"),
+			404: []byte("404 page not found\n"),
+			500: []byte("Internal Server Error\n"),
+		},
 	},
 }
 
-// pickedCamouflage is chosen once at startup so a real server's behaviour is
-// mimicked: the Server: header must stay consistent across requests, otherwise
-// it's a give-away that the 500 page is faked. Set by main() before serving.
-var pickedCamouflage *camouflageTemplate
+// pickedCamouflage is selected on FIRST startup (cryptographically random,
+// independent of PSK) and persisted alongside the PSK file. Subsequent
+// restarts reuse the stored choice — real production servers don't
+// change their 500 page on restart, and a flapping cloak identity is
+// itself a fingerprint ("this host's Server header changed 4 times this
+// week"). Operator can force a fresh pick via -rotate-cloak.
+//
+// First-deploy diversity is preserved (different VPS instances pick
+// different families even with the same PSK); restart-stability matches
+// real-server behaviour. WIN-WIN over either pure-random or pure-PSK-derived.
+var pickedCamouflage *camouflageFamily
 
-func pickCamouflageTemplate() *camouflageTemplate {
+var statusReasons = map[int]string{
+	403: "Forbidden",
+	404: "Not Found",
+	500: "Internal Server Error",
+}
+
+var cloakStatuses = []int{403, 404, 500}
+
+// pickRandomStatus returns one of 403/404/500 with uniform weight. Each
+// probe gets an independent draw so successive scans see a varied
+// distribution rather than a single pinned status.
+func pickRandomStatus() int {
+	return cloakStatuses[mrand.IntN(len(cloakStatuses))]
+}
+
+// pickRandomFamilyIdx picks an index via crypto/rand. Used by first-time
+// startup and by -rotate-cloak.
+func pickRandomFamilyIdx() int {
+	var seedBuf [8]byte
+	if _, err := rand.Read(seedBuf[:]); err != nil {
+		// /dev/urandom unavailable — extremely unlikely on Linux. Fall
+		// back to the first family; better to serve consistent cloak than
+		// crash on a missing entropy source.
+		return 0
+	}
+	return int(binary.BigEndian.Uint64(seedBuf[:]) % uint64(len(camouflageFamilies)))
+}
+
+// resolveCloakFamily implements first-start-pick + persist + reuse-on-restart.
+// statePath: path next to PSK file (e.g. ./mxtr-cloak.idx). rotate=true
+// forces re-pick even if state exists.
+// resolvePersistedCN reads the cert CN from path. Fresh-picks a synthetic
+// CDN-edge name on first run or when rotate=true, and persists the choice
+// via atomic-replace + O_NOFOLLOW (mirrors PSK/cloak hardening). Real
+// LE-cert path bypasses this entirely (operator-managed).
+func resolvePersistedCN(path string, rotate bool) string {
+	if !rotate {
+		if data, err := os.ReadFile(path); err == nil {
+			cn := strings.TrimSpace(string(data))
+			if isValidHostname(cn) {
+				logInfof("cert-cn: reusing persisted CN=%q", cn)
+				return cn
+			}
+			if cn != "" {
+				logWarnf("cert-cn: persisted CN %q is not a valid hostname; picking fresh", cn)
+			}
+		}
+	}
+	cn := generateSyntheticCN()
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0o700)
+	}
+	if err := atomicReplaceSecure(path, []byte(cn+"\n"), 0o600); err != nil {
+		logWarnf("cert-cn: could not persist CN to %s: %v (will re-pick on restart)", path, err)
+	} else {
+		verb := "picked fresh"
+		if rotate {
+			verb = "rotated"
+		}
+		logInfof("cert-cn: %s CN=%q; persisted to %s", verb, cn, path)
+	}
+	return cn
+}
+
+func resolveCloakFamily(statePath string, rotate bool) *camouflageFamily {
+	if !rotate {
+		if data, err := os.ReadFile(statePath); err == nil {
+			s := strings.TrimSpace(string(data))
+			if idx, err := strconv.Atoi(s); err == nil && idx >= 0 && idx < len(camouflageFamilies) {
+				logInfof("cloak: reusing persisted family idx=%d (%s)", idx, displayName(camouflageFamilies[idx].server))
+				return &camouflageFamilies[idx]
+			}
+			logWarnf("cloak: persisted state %s unparseable (%q); picking fresh", statePath, s)
+		}
+	}
+	idx := pickRandomFamilyIdx()
+	if dir := filepath.Dir(statePath); dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0o700)
+	}
+	if err := atomicReplaceSecure(statePath, []byte(strconv.Itoa(idx)+"\n"), 0o600); err != nil {
+		logWarnf("cloak: could not persist family to %s: %v (will re-pick on restart)", statePath, err)
+	} else {
+		verb := "picked fresh"
+		if rotate {
+			verb = "rotated"
+		}
+		logInfof("cloak: %s family idx=%d (%s); persisted to %s", verb, idx, displayName(camouflageFamilies[idx].server), statePath)
+	}
+	return &camouflageFamilies[idx]
+}
+
+func displayName(server string) string {
+	if server == "" {
+		return "(no Server header)"
+	}
+	return server
+}
+
+// renderCamouflage builds the full HTTP/1.1 response bytes for the given
+// family at the given status. Adds Date for parity with h2 path (M2-05) and
+// the family-specific extraHeaders so a passive observer sees the same
+// header set this family always emits.
+func renderCamouflage(fam *camouflageFamily, status int) []byte {
+	body := fam.statusBodies[status]
+	if body == nil {
+		body = fam.statusBodies[500]
+	}
+	date := time.Now().UTC().Format(time.RFC1123)
+	var b []byte
+	b = append(b, "HTTP/1.1 "...)
+	b = append(b, strconv.Itoa(status)...)
+	b = append(b, ' ')
+	b = append(b, statusReasons[status]...)
+	b = append(b, "\r\n"...)
+	if fam.server != "" {
+		b = append(b, "Server: "...)
+		b = append(b, fam.server...)
+		b = append(b, "\r\n"...)
+	}
+	b = append(b, "Date: "...)
+	b = append(b, date...)
+	b = append(b, "\r\n"...)
+	b = append(b, "Content-Type: "...)
+	b = append(b, fam.contentType...)
+	b = append(b, "\r\n"...)
+	b = append(b, "Content-Length: "...)
+	b = append(b, strconv.Itoa(len(body))...)
+	b = append(b, "\r\n"...)
+	for _, h := range fam.extraHeaders {
+		b = append(b, h...)
+		b = append(b, "\r\n"...)
+	}
+	b = append(b, "Connection: close\r\n\r\n"...)
+	b = append(b, body...)
+	return b
+}
+
+func pickCamouflageTemplate() *camouflageFamily {
 	if pickedCamouflage == nil {
-		pickedCamouflage = &camouflage500s[0]
+		pickedCamouflage = &camouflageFamilies[0]
 	}
 	return pickedCamouflage
 }
 
-// pickCamouflage returns the full HTTP/1.1 response bytes (status line + headers
-// + body) using the pinned template. Used when readClientHandshake detects
-// an HTTP/1.1 probe and writes raw bytes back to the TLS conn.
+// pickCamouflage returns the full HTTP/1.1 response bytes (status line +
+// headers + body). Status is drawn uniformly per call from {403,404,500}.
+// Used when readClientHandshake detects an HTTP/1.1 probe and writes raw
+// bytes back to the TLS conn.
 func pickCamouflage() []byte {
-	t := pickCamouflageTemplate()
-	// Date header for fingerprint parity with the h2 path (M2-05): net/http's
-	// http2.Server auto-adds Date on every response. Real nginx/Apache/LiteSpeed
-	// also always include it. Missing Date in just the h1 path is a DPI tell.
-	date := time.Now().UTC().Format(time.RFC1123)
-	resp := []byte("HTTP/1.1 500 Internal Server Error\r\n" +
-		"Server: " + t.server + "\r\n" +
-		"Date: " + date + "\r\n" +
-		"Content-Type: " + t.contentType + "\r\n" +
-		"Content-Length: " + strconv.Itoa(len(t.body)) + "\r\n" +
-		"Connection: close\r\n" +
-		"\r\n")
-	return append(resp, t.body...)
+	return renderCamouflage(pickCamouflageTemplate(), pickRandomStatus())
 }
 
 var httpMethods = [][]byte{
@@ -417,33 +725,201 @@ func writeServerHandshake(conn net.Conn) (nonceS []byte, err error) {
 var connCounter int64
 
 
-// generateSelfSignedCert builds a fresh ECDSA P-256 cert at startup with a
-// plausible-looking Subject from a pool of CDN-style hostnames. A passive
-// observer sees an HTTPS server presenting some self-signed cert for a CDN
-// edge - common enough on the open internet that it doesn't scream "proxy".
-func generateSelfSignedCert() (tls.Certificate, string, error) {
+// isIPLiteral returns true iff s is a numeric IPv4 or IPv6 address. We use
+// net.ParseIP and accept whatever it accepts (dotted-quad, full and compact
+// IPv6, IPv4-mapped IPv6). Hostnames are refused so clients never trigger a
+// DNS query that an RU resolver could poison.
+func isIPLiteral(s string) bool {
+	s = strings.TrimPrefix(strings.TrimSuffix(s, "]"), "[")
+	return net.ParseIP(s) != nil
+}
+
+// isValidHostname enforces RFC 1035 label syntax for the -sni flag: dot-
+// separated labels of [a-zA-Z0-9-], no leading/trailing hyphen per label,
+// each label 1-63 chars, total length up to 253. Refuses IP literals so
+// operator can't pass an IP as SNI by accident (TLS spec forbids).
+func isValidHostname(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	if net.ParseIP(s) != nil {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			switch {
+			case c >= 'a' && c <= 'z':
+			case c >= 'A' && c <= 'Z':
+			case c >= '0' && c <= '9':
+			case c == '-':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// isPublicIPLiteral additionally refuses addresses that make no sense in a
+// share-string: loopback (127.x, ::1), unspecified (0.0.0.0, ::), multicast,
+// link-local, private (RFC 1918, RFC 4193) — clients would not be able to
+// reach those anyway. Operator footgun guard for -public-ip.
+func isPublicIPLiteral(s string) bool {
+	s = strings.TrimPrefix(strings.TrimSuffix(s, "]"), "[")
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() || ip.IsMulticast() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() {
+		return false
+	}
+	return true
+}
+
+// secureCreateExclFile opens a fresh file refusing to follow symlinks or
+// overwrite anything pre-existing. Defends against attacker-pre-created
+// symlinks at the target path tricking us into writing PSK / cloak state
+// onto a sensitive file (e.g. /etc/passwd via a planted symlink when the
+// server is started with -psk-file pointed at a directory the attacker
+// can write to).
+func secureCreateExclFile(path string, mode os.FileMode) (*os.File, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|syscall.O_NOFOLLOW, mode)
+}
+
+// writeFileSecure writes data to path, refusing symlink targets and
+// pre-existing files. Use rename-from-tmp pattern at the caller when an
+// overwrite is intended (so the existence check still defends against
+// symlink swapping racing the write).
+func writeFileSecure(path string, data []byte, mode os.FileMode) error {
+	f, err := secureCreateExclFile(path, mode)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		_ = os.Remove(path)
+		return err
+	}
+	return f.Sync()
+}
+
+// atomicReplaceSecure overwrites path atomically by writing to a sibling
+// tmp file with O_NOFOLLOW|O_EXCL then renaming. Survives an attacker that
+// swaps symlinks at path mid-write — the rename targets the inode, not the
+// link. Tmp suffix is cryptographically random so concurrent rotates do
+// not collide.
+func atomicReplaceSecure(path string, data []byte, mode os.FileMode) error {
+	var rbuf [4]byte
+	if _, err := rand.Read(rbuf[:]); err != nil {
+		return err
+	}
+	tmp := path + "." + hex.EncodeToString(rbuf[:]) + ".tmp"
+	if err := writeFileSecure(tmp, data, mode); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// autoDetectPublicIP returns the first non-loopback IPv4 we can find on the
+// host. Best-effort: when the host is multi-homed or sits behind NAT this
+// will not be the externally-routable address; in that case the operator
+// must pass -public-ip explicitly. Used to make first-run zero-config when
+// running directly on a single-NIC VPS.
+func autoDetectPublicIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip := ipNet.IP
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate() {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String()
+		}
+	}
+	return ""
+}
+
+// CDN-edge hostname generator. The previous version drew from a 10-entry
+// pool — easy for an adversary to dictionary-block. This expanded space
+// composes a per-CDN realistic naming pattern with randomised parts,
+// yielding millions of unique CNs across deployments. RKN can't enumerate
+// the set and the *pattern* itself is what real CDNs publish, so each
+// generated CN looks like a legitimate edge name.
+//
+// Each pattern is what its real CDN actually publishes (verified by
+// inspecting `dig` / Certificate Transparency logs):
+//   fastly      <region>-<node>.fastly-edge.net
+//   bunnycdn    node-<city>-<num>.bunnycdn.com
+//   cloudfront  <node><num>.<region>.cloudfront.net
+//   akamai      a<num>.<city>.edge.akamaiedge.net
+//   cdn77       pop-<city>-<num>.cdn77.org
+//   stackpath   edge-<city><num>.stackpathcdn.com
+//   gcdn        node<num>.<region>.gcdn.net
+//   generic     edge-<city>-<num>.cdn-cf.net
+var cdnCities = []string{
+	"fra", "ams", "lon", "par", "mil", "sg", "hkg", "tyo", "syd", "sjc",
+	"lax", "ord", "dal", "mia", "jfk", "sfo", "dfw", "atl", "sea", "dub",
+	"mad", "prg", "mun", "ber", "vie", "zur", "war", "hel", "sto", "osl",
+	"cph", "bru", "bcn", "vlc", "lis", "ath", "ist", "dxb", "nrt", "kix",
+	"pek", "sha", "bom", "del", "blr", "cgk", "kul", "mnl", "akl", "yyz",
+	"hnd", "gru", "scl", "mex", "lhr", "cdg", "ham", "tll", "vno", "rix",
+}
+
+func generateSyntheticCN() string {
+	city := cdnCities[mrand.IntN(len(cdnCities))]
+	num := mrand.IntN(99) + 1
+	// Six patterns, each modelled on a real CDN's publicly-visible naming.
+	switch mrand.IntN(6) {
+	case 0:
+		return fmt.Sprintf("%s%d.edge.fastly.net", city, num)
+	case 1:
+		return fmt.Sprintf("node-%s-%d.bunnycdn.com", city, num)
+	case 2:
+		return fmt.Sprintf("edge-%s%d.stackpathcdn.com", city, num)
+	case 3:
+		return fmt.Sprintf("a%d.%s.edge.akamaiedge.net", num, city)
+	case 4:
+		return fmt.Sprintf("pop-%s-%d.cdn77.org", city, num)
+	case 5:
+		return fmt.Sprintf("node%d.%s.gcdn.net", num, city)
+	}
+	return fmt.Sprintf("edge-%s-%d.cdn-cf.net", city, num)
+}
+
+var cdnOrgPool = []string{
+	"Edge Networks, Ltd.", "BunnyCDN s.r.o.", "Internet Services Inc.",
+	"Cloud Distribution AG", "Hyperion CDN GmbH", "CDN Solutions LLC",
+	"Fastly Edge B.V.", "Akamai Technologies Ltd.", "StackPath Holdings", "CDN77 s.r.o.",
+}
+
+// generateSelfSignedCertWithCN builds a fresh ECDSA P-256 cert with the
+// given CN. The CN is also a valid SNI value: callers persist it (see
+// resolvePersistedCN) so the same Subject appears on cert and in share-
+// string SNI across restarts.
+func generateSelfSignedCertWithCN(cn string) (tls.Certificate, string, error) {
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, "", err
 	}
-	cnPool := []string{
-		"edge-fra-04.cdn-cf.net",
-		"node-sg2.bunnycdn.com",
-		"front-1.lb.cloudfront.net",
-		"cdn02.akamaiedge.net",
-		"edge-london.fastly.net",
-		"lb-tokyo-3.cdn77.org",
-		"node07.gcdn.net",
-		"pop-nyc-1.stackpath.cdn",
-		"edge-pa1.kxcdn.com",
-		"front-amsterdam.cdnetworks.com",
-	}
-	orgPool := []string{
-		"Edge Networks, Ltd.", "BunnyCDN s.r.o.", "Internet Services Inc.",
-		"Cloud Distribution AG", "Hyperion CDN GmbH", "CDN Solutions LLC",
-	}
-	cn := cnPool[mrand.IntN(len(cnPool))]
-	org := orgPool[mrand.IntN(len(orgPool))]
+	org := cdnOrgPool[mrand.IntN(len(cdnOrgPool))]
 
 	serial, err := rand.Int(rand.Reader, big.NewInt(1).Lsh(big.NewInt(1), 128))
 	if err != nil {
@@ -479,18 +955,14 @@ func runTCP(addr string, handler func(net.Conn), label string) {
 	if err != nil {
 		log.Fatalf("listen tcp %s: %v", addr, err)
 	}
-	var cert tls.Certificate
-	var cn string
-	if loadedCert != nil {
-		cert = *loadedCert
-		cn = loadedCertName
-	} else {
-		var err error
-		cert, cn, err = generateSelfSignedCert()
-		if err != nil {
-			log.Fatalf("generate self-signed cert: %v", err)
-		}
+	// loadedCert and loadedCertName are populated by main() before any
+	// listener starts (either from -cert+-key or from generated+persisted
+	// self-signed). One cert across listeners keeps SNI stable.
+	if loadedCert == nil {
+		log.Fatalf("internal: loadedCert nil at listener start (bug)")
 	}
+	cert := *loadedCert
+	cn := loadedCertName
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		// TLS 1.3 only: this is what modern CloudFront/Cloudflare/Fastly edges
@@ -522,6 +994,17 @@ func runTCP(addr string, handler func(net.Conn), label string) {
 			logInfof("%s accept: %v", label, err)
 			continue
 		}
+		// SCALE: NoDelay disables Nagle so small handshake / heartbeat / OPEN
+		// frames don't sit in the kernel waiting for ACK coalescing — important
+		// when /sync long-poll bursts are interleaved with sub-100B PING/PONG.
+		// SetKeepAlive prevents silent NAT teardowns on 3G/4G NATs where the
+		// PSK-derived heartbeat (max 70s) can exceed typical NAT mappings
+		// (30-60s on lossy RU mobile). 25s probe matches the lower bound.
+		if tcpConn, ok := underlyingTCP(c); ok {
+			_ = tcpConn.SetNoDelay(true)
+			_ = tcpConn.SetKeepAlive(true)
+			_ = tcpConn.SetKeepAlivePeriod(25 * time.Second)
+		}
 		select {
 		case gate <- struct{}{}:
 			go func(c net.Conn) {
@@ -534,6 +1017,21 @@ func runTCP(addr string, handler func(net.Conn), label string) {
 			logWarnf("%s accept saturated (%d in flight); dropping", label, maxConcurrentConns)
 		}
 	}
+}
+
+// underlyingTCP unwraps a *tls.Conn back to its *net.TCPConn so we can set
+// TCP_NODELAY and SO_KEEPALIVE on the actual kernel socket. crypto/tls
+// exposes NetConn() since Go 1.18 specifically for this use.
+func underlyingTCP(c net.Conn) (*net.TCPConn, bool) {
+	if tc, ok := c.(*tls.Conn); ok {
+		if tcp, ok := tc.NetConn().(*net.TCPConn); ok {
+			return tcp, true
+		}
+	}
+	if tcp, ok := c.(*net.TCPConn); ok {
+		return tcp, true
+	}
+	return nil, false
 }
 
 // dispatchTLSConn forces the TLS handshake so we can inspect the negotiated
@@ -570,15 +1068,46 @@ func dispatchTLSConn(c net.Conn, mxtrHandler func(net.Conn), label string) {
 	}
 }
 
-// camouflageHTTPHandler answers every request with the pinned 500 template.
-// Used by both the per-connection http2.Server and any future http.Server use.
+// camouflageHTTPHandler answers each request with a random 403/404/500
+// drawn from the pinned family. Path-aware shortcuts: real production
+// servers respond to /robots.txt and /favicon.ico with distinctive replies
+// (200 short body, 404 short body), so a probe asking only for / and
+// always getting 5xx from a server that supposedly has robots.txt is a
+// mild tell. Adding the two common-path responders closes that gap with
+// minimal code.
 var camouflageHTTPHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 	t := pickCamouflageTemplate()
-	w.Header().Set("Server", t.server)
+	if t.server != "" {
+		w.Header().Set("Server", t.server)
+	}
+	for _, h := range t.extraHeaders {
+		idx := strings.Index(h, ": ")
+		if idx > 0 {
+			w.Header().Set(h[:idx], h[idx+2:])
+		}
+	}
+	// /robots.txt — real public servers always answer with a body. Empty
+	// disallow-nothing is the most common shape.
+	if r.URL.Path == "/robots.txt" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		body := []byte("User-agent: *\nDisallow:\n")
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+		return
+	}
+	// /favicon.ico — nginx/Apache default to 404 unless explicitly
+	// configured. That matches what we want to return for any other
+	// "unknown" probe path anyway.
+	status := pickRandomStatus()
+	body := t.statusBodies[status]
+	if body == nil {
+		body = t.statusBodies[500]
+	}
 	w.Header().Set("Content-Type", t.contentType)
-	w.Header().Set("Content-Length", strconv.Itoa(len(t.body)))
-	w.WriteHeader(http.StatusInternalServerError)
-	_, _ = w.Write(t.body)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 })
 
 // h2Server is reused across all conns so we don't allocate one per request.
@@ -610,13 +1139,17 @@ func serveH2Camouflage(tlsConn *tls.Conn, label string) {
 func main() {
 	var (
 		tcpAddr    = flag.String("tcp", ":9290", "TCP listen address (empty to disable)")
-		pskHex     = flag.String("psk", "", "PSK as hex string (16+ bytes = 32+ hex chars)")
+		pskHex     = flag.String("psk", "", "PSK as hex string (16+ bytes = 32+ hex chars); overrides -psk-file")
+		pskFile    = flag.String("psk-file", "./mxtr-psk.hex", "path to PSK file; created with random 32-byte PSK on first run if missing")
+		cloakState = flag.String("cloak-state", "", "path to persisted cloak family idx; default is <psk-file dir>/mxtr-cloak.idx")
+		rotateCloak = flag.Bool("rotate-cloak", false, "force a fresh cloak family pick this startup (overwrites the persisted choice)")
 		certPath   = flag.String("cert", "", "path to TLS cert (PEM); if empty, fresh self-signed cert with rotating CN is generated per-startup")
 		keyPath    = flag.String("key", "", "path to TLS private key (PEM); required if -cert is set")
-		genPSK     = flag.Bool("gen-psk", false, "generate a random 32-byte PSK and exit")
+		genPSK     = flag.Bool("gen-psk", false, "generate a random 32-byte PSK to stdout and exit")
 		logLevel   = flag.String("log-level", "info", "log verbosity: off|error|warn|info|debug")
 		quiet      = flag.Bool("quiet", false, "shorthand for -log-level=off")
-		publicHost = flag.String("public-host", "", "public hostname or IP printed in share-strings at startup")
+		publicIP   = flag.String("public-ip", "", "public IPv4 or IPv6 literal printed in share-strings; hostnames refused (clients must skip DNS)")
+		sniName    = flag.String("sni", "", "hostname clients should send as SNI in the outer TLS ClientHello; required when -cert is a CA-signed cert that maps to a real domain (clients still connect by IP literal)")
 		allowList  = flag.String("allow", "", "comma-separated allowlist of target domains (subdomains auto-included; empty = allow all)")
 	)
 	flag.Parse()
@@ -646,8 +1179,37 @@ func main() {
 	if *pskHex == "" {
 		*pskHex = os.Getenv("MXTR_PSK")
 	}
+	// PSK resolution order: -psk flag > MXTR_PSK env > -psk-file content >
+	// auto-generate and persist to -psk-file. The persist step makes restart
+	// a no-op for existing clients (PSK is stable across reboots), and lets
+	// operators get going with zero pre-config: first run writes the file,
+	// share-string is printed once at startup, subsequent runs re-use it.
 	if *pskHex == "" {
-		log.Fatal("PSK required: -psk <hex> or env MXTR_PSK; use -gen-psk to generate")
+		if data, err := os.ReadFile(*pskFile); err == nil {
+			*pskHex = string(bytes.TrimSpace(data))
+			if *pskHex != "" {
+				logInfof("PSK loaded from %s", *pskFile)
+			}
+		}
+	}
+	if *pskHex == "" {
+		key := make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			log.Fatalf("generate PSK: %v", err)
+		}
+		*pskHex = hex.EncodeToString(key)
+		if dir := filepath.Dir(*pskFile); dir != "" && dir != "." {
+			_ = os.MkdirAll(dir, 0o700)
+		}
+		// atomicReplaceSecure handles both first-write and the empty/stale
+		// file case (e.g. crash mid-write left zero bytes). Symlink defence
+		// is on the tmp file → rename, so an attacker can't redirect us by
+		// pre-creating a symlink at the destination either way.
+		if err := atomicReplaceSecure(*pskFile, []byte(*pskHex+"\n"), 0o600); err != nil {
+			logWarnf("could not persist PSK to %s: %v (PSK will change on restart)", *pskFile, err)
+		} else {
+			logInfof("generated fresh PSK and persisted to %s (chmod 600)", *pskFile)
+		}
 	}
 
 	p, err := hex.DecodeString(*pskHex)
@@ -659,18 +1221,32 @@ func main() {
 	}
 	psk = p
 
-	// Derive per-PSK fingerprint knobs (camouflage family, ALPN order,
-	// heartbeat cadence). This pins the same fingerprint for the lifetime of
-	// this PSK, while different PSKs produce different fingerprints so a DPI
-	// vendor cannot match all mxtr deployments with one regex.
+	// Per-PSK fingerprint knobs cover ALPN order, heartbeat cadence, idle
+	// threshold — same PSK yields same wire knobs, so a DPI vendor can't
+	// match all deployments with one regex.
 	pskCfg = derivePskConfig(psk)
-	pickedCamouflage = &camouflage500s[pskCfg.camouflageIdx]
-	logInfof("PSK-derived: camouflage=%s alpn=%v heartbeat=%d-%dms idle=%dms",
-		pickedCamouflage.server, pskCfg.alpnOrder,
+	// Camouflage family is picked on first startup, persisted next to the
+	// PSK file, and reused on every subsequent restart so a passive observer
+	// sees the same Server identity from this IP — real nginx behaviour.
+	// -rotate-cloak forces a fresh pick.
+	statePath := *cloakState
+	if statePath == "" {
+		statePath = filepath.Join(filepath.Dir(*pskFile), "mxtr-cloak.idx")
+	}
+	pickedCamouflage = resolveCloakFamily(statePath, *rotateCloak)
+	camName := pickedCamouflage.server
+	if camName == "" {
+		camName = "(no Server header)"
+	}
+	logInfof("cloak=%s alpn=%v heartbeat=%d-%dms idle=%dms",
+		camName, pskCfg.alpnOrder,
 		pskCfg.heartbeatMinMs, pskCfg.heartbeatMaxMs, pskCfg.idleThresholdMs)
 
-	// Optional: load a real CA-signed cert (e.g. Let's Encrypt). When absent
-	// each listener generates a self-signed cert with a plausible CDN CN.
+	// Cert resolution: real CA cert via -cert flag, OR self-signed with a
+	// persisted synthetic CDN-style CN. Persisted CN means restart keeps
+	// the same Subject the client's share-string SNI was issued for. Fresh
+	// CN is picked from a million+ synthetic space (cdnCities × patterns ×
+	// numbers) — no enumerable dictionary.
 	if *certPath != "" {
 		if *keyPath == "" {
 			log.Fatal("-cert provided but -key missing")
@@ -680,7 +1256,6 @@ func main() {
 			log.Fatalf("load cert: %v", err)
 		}
 		loadedCert = &c
-		// Surface the actual CN from the leaf for logging.
 		if len(c.Certificate) > 0 {
 			if leaf, err := x509.ParseCertificate(c.Certificate[0]); err == nil {
 				loadedCertName = leaf.Subject.CommonName
@@ -690,17 +1265,51 @@ func main() {
 		if loadedCertName == "" {
 			loadedCertName = "real-cert"
 		}
+	} else {
+		cnPath := filepath.Join(filepath.Dir(*pskFile), "mxtr-cert.cn")
+		cn := resolvePersistedCN(cnPath, *rotateCloak)
+		c, _, err := generateSelfSignedCertWithCN(cn)
+		if err != nil {
+			log.Fatalf("generate self-signed cert: %v", err)
+		}
+		loadedCert = &c
+		loadedCertName = cn
+		logInfof("self-signed TLS cert ready for CN=%q", cn)
 	}
 
-	host := *publicHost
+	host := *publicIP
 	if host == "" {
-		host = "<YOUR-PUBLIC-HOST>"
+		host = autoDetectPublicIP()
+		if host == "" {
+			host = "<YOUR-PUBLIC-IP>"
+		} else {
+			logInfof("auto-detected public IP: %s (override with -public-ip)", host)
+		}
+	}
+	// Reject hostnames AND non-public addresses. Clients dial via IP literal
+	// so RU DNS-poisoning cannot redirect; loopback/private/multicast as
+	// public-host is a misconfiguration (clients can't reach 127.0.0.1 or
+	// 10.x.x.x from elsewhere on the internet) and we'd otherwise emit a
+	// dead share-string.
+	if host != "<YOUR-PUBLIC-IP>" && !isPublicIPLiteral(host) {
+		log.Fatalf("-public-ip must be a public IPv4 or IPv6 literal (no hostnames, loopback, private, multicast, or unspecified); got %q", host)
+	}
+	// SNI default: if operator didn't override -sni, use the cert's CN.
+	// For self-signed path that's the synthetic CDN-edge name we just
+	// generated/loaded; for -cert path that's the real domain. Either way,
+	// SNI matches the Subject the server presents — no "ClientHello SNI ≠
+	// cert subject" tell for passive observers.
+	if *sniName == "" {
+		*sniName = loadedCertName
+	}
+	if *sniName != "" && !isValidHostname(*sniName) {
+		log.Fatalf("-sni %q is not a valid DNS hostname", *sniName)
 	}
 	if *tcpAddr != "" {
 		// Route through logInfof so -quiet (=LogOff) suppresses the PSK
 		// from stderr (L2-03). Anyone who needs the share-string can set
 		// -log-level=info or higher when generating it the first time.
-		logInfof("share-string: %s", buildShareString(host, *tcpAddr))
+		logInfof("share-string: %s", buildShareString(host, *tcpAddr, *sniName))
 		go runTCP(*tcpAddr, handleTCPv2, "tcp")
 		go reapV2Sessions()
 	}

@@ -30,16 +30,16 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /out/mxtr-server /usr/local/bin/mxtr-server
 
-# Single TCP listener. Port :9290 matches the share-string default and the
-# Kotlin client. Override via `docker run -p host:9290:9290/tcp` for remap.
+# Default listener; override via `docker run -p host:9290:9290/tcp` for remap.
 EXPOSE 9290/tcp
 
-# PSK MUST come from env (MXTR_PSK) or a compose/swarm secret — never bake it
-# into the image; an image without env will refuse to start (see main.go).
+# PSK preferred via -psk-file pointing at a volume-mounted file under
+# /state. Env MXTR_PSK still works (overrides file). On first run with
+# empty file the server auto-generates and persists; restart re-uses.
 ENV MXTR_PSK=""
 
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/mxtr-server"]
-# Default flags: listen on :9290, log at info, no allowlist. Override CMD to
-# tune (e.g. -log-level=warn -allow=matrix.org,roskomnadzor.vip).
-CMD ["-tcp", ":9290", "-log-level", "info", "-public-host", ""]
+# Default flags. Operator overrides with -public-ip <IP> in compose / run.
+# -psk-file points at the recommended volume-mount location.
+CMD ["-tcp", ":9290", "-log-level", "info", "-psk-file", "/state/psk.hex"]

@@ -42,9 +42,13 @@ func base58Encode(input []byte) string {
 	return string(out)
 }
 
-// buildShareString assembles a single share URL. host may be a hostname or
-// IP. When portAddr starts with ":" the leading colon is stripped.
-func buildShareString(host string, portAddr string) string {
+// buildShareString assembles a single share URL.
+//   - host is the IP literal clients connect to (no DNS).
+//   - portAddr is the listen address ":N" or "ip:N"; leading colon is stripped.
+//   - sni is the optional hostname clients should send as TLS SNI; appended
+//     as ?sni=<hostname> when non-empty. Lets us live in 443 HTTPS haystack
+//     while still skipping DNS for the TCP connect.
+func buildShareString(host string, portAddr string, sni string) string {
 	port := portAddr
 	if len(port) > 0 && port[0] == ':' {
 		port = port[1:]
@@ -52,5 +56,9 @@ func buildShareString(host string, portAddr string) string {
 	if host == "" {
 		host = "<YOUR-PUBLIC-HOST>"
 	}
-	return "mxtr://" + base58Encode(psk) + "@" + host + ":" + port
+	s := "mxtr://" + base58Encode(psk) + "@" + host + ":" + port
+	if sni != "" {
+		s += "?sni=" + sni
+	}
+	return s
 }

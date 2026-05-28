@@ -47,7 +47,7 @@ func derivePskConfig(psk []byte) pskDerivedConfig {
 	}
 
 	return pskDerivedConfig{
-		camouflageIdx:    int(out[0]) % len(camouflage500s),
+		camouflageIdx:    int(out[0]) % len(camouflageFamilies),
 		alpnOrder:        alpn,
 		heartbeatMinMs:   20_000 + int(out[2])*100,                                 // 20-45.5s
 		heartbeatMaxMs:   45_000 + int(out[3])*100,                                 // 45-70.5s

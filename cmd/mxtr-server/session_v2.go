@@ -445,7 +445,24 @@ func handleTCPv2(conn net.Conn) {
 		case v2TypeClose:
 			sess.closeStream(streamID)
 		case v2TypePing:
-			_ = sess.writeStreamFrame(0, v2TypePong, payload)
+			// Decouple PONG timing from PING arrival by 0-15ms so the
+			// "every PING is matched by PONG within <1ms" tell — a strong
+			// signal a flow-shape ML classifier learns to use — is broken.
+			// Copy payload because the read buffer is reused on next loop.
+			// Select on sess.done so a closing session unblocks the timer
+			// instead of leaving an orphan goroutine sleeping its way to a
+			// guaranteed-failed write.
+			payloadCopy := append([]byte(nil), payload...)
+			go func() {
+				if d := mrand.IntN(16); d > 0 {
+					select {
+					case <-time.After(time.Duration(d) * time.Millisecond):
+					case <-sess.done:
+						return
+					}
+				}
+				_ = sess.writeStreamFrame(0, v2TypePong, payloadCopy)
+			}()
 		case v2TypePong:
 			// ignore
 		default:

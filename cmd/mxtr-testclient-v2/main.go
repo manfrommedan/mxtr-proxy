@@ -35,9 +35,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	mrand "math/rand/v2"
 	"net"
+	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,7 +69,13 @@ const (
 	typeOpenErr byte = 0x07
 )
 
-var padSizes = []int{256, 512, 1024, 2048, 4096, 8192, 16384}
+// padSizes mirrors mxtr-server's PADME-style 13-rung ladder. Both ends pad
+// independently — wire only carries encrypted ct length — but matching the
+// ladder keeps the testclient's send fingerprint in line with the Kotlin
+// client. Old 7-rung ladder is intentionally NOT kept; the server-side
+// reader accepts any padded inner length up to maxCiphertext, so wire-compat
+// is unaffected, only fingerprint posture changes.
+var padSizes = []int{256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384}
 
 func nextPadSize(n int) int {
 	for _, s := range padSizes {
@@ -74,6 +84,127 @@ func nextPadSize(n int) int {
 		}
 	}
 	return padSizes[len(padSizes)-1]
+}
+
+// bumpProbability + pickPadRung mirror mxtr-server's size-scaled distribution
+// smoother. Small signaling frames blend bucket counts where it matters
+// most; large frames don't pay extra bandwidth for marginal diversity.
+func bumpProbability(minSize int) int {
+	switch {
+	case minSize < 1024:
+		return 30
+	case minSize < 4096:
+		return 18
+	default:
+		return 8
+	}
+}
+
+func pickPadRung(minSize int) int {
+	base := nextPadSize(minSize)
+	if mrand.IntN(100) >= bumpProbability(minSize) {
+		return base
+	}
+	for i, s := range padSizes {
+		if s == base && i+1 < len(padSizes) {
+			return padSizes[i+1]
+		}
+	}
+	return base
+}
+
+// isIPLiteral mirrors mxtr-server: refuses hostnames so the testclient never
+// triggers DNS for the mxtr endpoint. SNI carries no real hostname either
+// (cert is self-signed CDN-style CN), so no DNS leak in any path.
+func isIPLiteral(s string) bool {
+	s = strings.TrimPrefix(strings.TrimSuffix(s, "]"), "[")
+	return net.ParseIP(s) != nil
+}
+
+// --- share-string parser, mirrors Kotlin MxtrShareString.parse ---
+
+const b58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+func base58Decode(s string) ([]byte, error) {
+	if s == "" {
+		return nil, errors.New("empty base58")
+	}
+	zeros := 0
+	for zeros < len(s) && s[zeros] == b58Alphabet[0] {
+		zeros++
+	}
+	n := new(big.Int)
+	base := big.NewInt(58)
+	for _, c := range s {
+		idx := strings.IndexRune(b58Alphabet, c)
+		if idx < 0 {
+			return nil, fmt.Errorf("bad base58 char %q", c)
+		}
+		n.Mul(n, base)
+		n.Add(n, big.NewInt(int64(idx)))
+	}
+	out := n.Bytes()
+	return append(make([]byte, zeros), out...), nil
+}
+
+type shareData struct {
+	host   string
+	port   int
+	pskHex string
+	// sni is the optional hostname clients should present in the outer TLS
+	// ClientHello so SNI matches the cert Subject the server emits. Empty
+	// means "use the host string as SNI" — fine for IP-literal hosts when
+	// no real cert is in play. Comes from ?sni= query in the share-string.
+	sni string
+}
+
+func parseShareString(s string) (*shareData, error) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "mxtr://") {
+		return nil, errors.New("share-string must start with mxtr://")
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return nil, fmt.Errorf("parse: %w", err)
+	}
+	if u.Scheme != "mxtr" {
+		return nil, errors.New("scheme not mxtr")
+	}
+	if u.User == nil {
+		return nil, errors.New("share-string missing PSK (mxtr://<psk>@<ip>:<port>)")
+	}
+	pskB58 := u.User.Username()
+	if pskB58 == "" {
+		return nil, errors.New("empty PSK")
+	}
+	if _, password := u.User.Password(); password {
+		return nil, errors.New("share-string userInfo must not contain ':'")
+	}
+	pskBytes, err := base58Decode(pskB58)
+	if err != nil {
+		return nil, fmt.Errorf("decode PSK: %w", err)
+	}
+	if len(pskBytes) != 32 {
+		return nil, fmt.Errorf("PSK must be 32 bytes; got %d", len(pskBytes))
+	}
+	host := u.Hostname()
+	if !isIPLiteral(host) {
+		return nil, fmt.Errorf("share-string host must be IP literal (no DNS); got %q", host)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("invalid port %q", u.Port())
+	}
+	sni := u.Query().Get("sni")
+	if sni != "" && net.ParseIP(sni) != nil {
+		return nil, errors.New("?sni= must be a hostname, not an IP")
+	}
+	return &shareData{
+		host:   host,
+		port:   port,
+		pskHex: hex.EncodeToString(pskBytes),
+		sni:    sni,
+	}, nil
 }
 
 // --- crypto helpers (mirror server) ---
@@ -89,7 +220,12 @@ func deriveKey(psk, nonceC, nonceS []byte, info string) []byte {
 	salt := append(append([]byte{}, nonceC...), nonceS...)
 	r := hkdf.New(sha256.New, psk, salt, []byte(info))
 	out := make([]byte, chacha20poly1305.KeySize)
-	io.ReadFull(r, out)
+	// hkdf.New never returns a short read in current x/crypto; on impl
+	// drift we'd silently use a zero-padded key here. Panic instead — the
+	// only path leading here is a programmer error.
+	if _, err := io.ReadFull(r, out); err != nil {
+		panic("hkdf read: " + err.Error())
+	}
 	return out
 }
 
@@ -103,7 +239,7 @@ func writeAEADFrame(w io.Writer, aead cipher.AEAD, seq uint64, pt []byte) error 
 	if len(pt) > maxPlaintext {
 		return fmt.Errorf("plaintext too large %d", len(pt))
 	}
-	innerSize := nextPadSize(len(pt) + 2)
+	innerSize := pickPadRung(len(pt) + 2)
 	inner := make([]byte, innerSize)
 	binary.BigEndian.PutUint16(inner[:2], uint16(len(pt)))
 	copy(inner[2:], pt)
@@ -197,12 +333,27 @@ type session struct {
 	closed   atomic.Bool
 }
 
-func dialSession(serverHost string, serverPort int, psk []byte) (*session, error) {
-	raw, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", serverHost, serverPort), 10*time.Second)
+func dialSession(serverHost string, serverPort int, psk []byte, sni string) (*session, error) {
+	if !isIPLiteral(serverHost) {
+		return nil, fmt.Errorf("mxtr server must be IP literal (no DNS); got %q", serverHost)
+	}
+	raw, err := net.DialTimeout("tcp", net.JoinHostPort(serverHost, strconv.Itoa(serverPort)), 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
+	// ServerName in tls.Config drives the SNI value sent in ClientHello.
+	// When the share-string carries ?sni=<hostname>, present that name so a
+	// passive observer sees an HTTPS handshake to a normal hostname — even
+	// though our TCP connect is by IP literal and skipped DNS. ServerName=""
+	// (no sni in share-string) makes tls.Client send SNI=IP-literal/empty
+	// per RFC, which is a tell — set explicitly to the host IP only as a
+	// fallback so we never accidentally emit a hostname we didn't intend.
+	serverName := sni
+	if serverName == "" {
+		serverName = serverHost
+	}
 	tlsConn := tls.Client(raw, &tls.Config{
+		ServerName:         serverName,
 		InsecureSkipVerify: true,
 		// Pin TLS 1.3 to match the real Kotlin client's fingerprint posture
 		// (WR-03). Server (main.go) already enforces 1.3 only so MinVersion=1.2
@@ -602,36 +753,74 @@ func (c *streamConn) SetWriteDeadline(t time.Time) error { return nil }
 // --- main ---
 
 func main() {
-	server := flag.String("server", "127.0.0.1:9290", "mxtr v2 server host:port")
-	pskHex := flag.String("psk", "", "PSK as hex (or env MXTR_PSK)")
+	share := flag.String("share", "", "mxtr share-string (mxtr://<base58-psk>@<ip>:<port>); preferred input — overrides -server/-psk")
+	server := flag.String("server", "", "mxtr v2 server IP:port (only used when -share is empty)")
+	pskHex := flag.String("psk", "", "PSK as hex (or env MXTR_PSK); only used when -share is empty")
+	pskFile := flag.String("psk-file", "", "path to PSK file written by mxtr-server (e.g. ./mxtr-psk.hex); used when -psk and MXTR_PSK are unset")
 	method := flag.String("method", "socks5", "socks5 | http | https")
 	target := flag.String("target", "matrix.org:443", "target for http/https mode")
 	socksAddr := flag.String("socks-addr", "127.0.0.1:1984", "local SOCKS5 listen for socks5 mode (override with any free port)")
 	flag.Parse()
 
-	if *pskHex == "" {
-		*pskHex = os.Getenv("MXTR_PSK")
-	}
-	if *pskHex == "" {
-		log.Fatal("PSK required")
-	}
-	psk, err := hex.DecodeString(*pskHex)
-	if err != nil {
-		log.Fatalf("bad PSK hex: %v", err)
+	var (
+		host string
+		port int
+		psk  []byte
+		sni  string
+	)
+	if *share != "" {
+		sd, err := parseShareString(*share)
+		if err != nil {
+			log.Fatalf("bad share-string: %v", err)
+		}
+		host = sd.host
+		port = sd.port
+		sni = sd.sni
+		psk, _ = hex.DecodeString(sd.pskHex)
+	} else {
+		if *server == "" {
+			log.Fatal("need -share <mxtr://...> OR -server <ip:port> + (-psk|-psk-file|env MXTR_PSK)")
+		}
+		h, portStr, err := net.SplitHostPort(*server)
+		if err != nil {
+			log.Fatalf("bad -server: %v", err)
+		}
+		host = h
+		port, err = strconv.Atoi(portStr)
+		if err != nil {
+			log.Fatalf("bad port in -server: %v", err)
+		}
+		if *pskHex == "" {
+			*pskHex = os.Getenv("MXTR_PSK")
+		}
+		if *pskHex == "" && *pskFile != "" {
+			data, err := os.ReadFile(*pskFile)
+			if err != nil {
+				log.Fatalf("read -psk-file %s: %v", *pskFile, err)
+			}
+			*pskHex = strings.TrimSpace(string(data))
+		}
+		if *pskHex == "" {
+			log.Fatal("PSK required: -psk, env MXTR_PSK, or -psk-file")
+		}
+		psk, err = hex.DecodeString(*pskHex)
+		if err != nil {
+			log.Fatalf("bad PSK hex: %v", err)
+		}
+		if len(psk) < 16 {
+			log.Fatalf("PSK must be at least 16 bytes; got %d", len(psk))
+		}
 	}
 
-	host, portStr, err := net.SplitHostPort(*server)
-	if err != nil {
-		log.Fatalf("bad -server: %v", err)
-	}
-	var port int
-	fmt.Sscanf(portStr, "%d", &port)
-
-	sess, err := dialSession(host, port, psk)
+	sess, err := dialSession(host, port, psk, sni)
 	if err != nil {
 		log.Fatalf("session: %v", err)
 	}
-	log.Printf("session established to %s", *server)
+	if sni != "" {
+		log.Printf("session established to %s:%d (SNI=%s)", host, port, sni)
+	} else {
+		log.Printf("session established to %s:%d (no SNI)", host, port)
+	}
 
 	switch *method {
 	case "socks5":
