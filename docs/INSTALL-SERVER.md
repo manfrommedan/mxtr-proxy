@@ -201,12 +201,12 @@ mkdir -p /var/lib/mxtr && chmod 700 /var/lib/mxtr
 ```bash
 # 1. Активное зондирование: сервер должен прикинуться обычным веб-сервером с 4xx/5xx.
 curl -ksv https://<vps-ip>:<port>/
-# HTTP/2 403 (или 404, или 500) + server: nginx (или один из 6 семейств)
+# HTTP/1.1 403 (или 404, или 500) + server: nginx (или один из 6 семейств)
 # date: <текущее UTC>
 
 # 1b. /robots.txt - 200, реалистичный.
 curl -ksv https://<vps-ip>:<port>/robots.txt
-# HTTP/2 200
+# HTTP/1.1 200
 # User-agent: *
 # Disallow:
 

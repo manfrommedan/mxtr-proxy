@@ -43,8 +43,10 @@ dst-IP - обычный VPS в хостинг-ASN (проверяемая лож
 share-string). Сервер представляет cert с тем же subject. Совпадение
 SNI/cert на wire - нет "SNI≠cert" тели, которую TSPU отслеживает с 2022.
 
-ALPN: server предлагает `h2,http/1.1` (порядок выбирается из PSK).
-Так пассивный наблюдатель видит обычный HTTPS-сервер, отдающий HTTP/2.
+ALPN: server предлагает **только `http/1.1`**. h2 намеренно не предлагаем -
+h2-зонд ушёл бы в Go-`http2.Server`, чей SETTINGS-фрейм палит стек как Go и
+противоречит nginx/cloudflare-камуфляжу. Наблюдатель видит обычный
+http/1.1-сервер; боевой клиент ALPN не шлёт вовсе.
 
 Аутентификация - **не** через X509, а через PSK-HMAC внутри handshake
 (см. ниже). Клиент проверяет в cert только: chain не пустой, не
@@ -168,7 +170,7 @@ SO_TIMEOUT на TLS-сокете = `heartbeatMaxMs + 30_000`. Если за эт
 ## Camouflage HTTP
 
 Если на тот же порт пришёл запрос, который **не** прошёл mxtr-handshake
-(пустой read, или валидный HTTP/1.1/HTTP/2) - сервер отвечает как
+(пустой read, или валидный HTTP/1.1) - сервер отвечает как
 обычный, плохо сконфигурированный web-сервер. Шесть семейств шаблонов,
 по одному на startup, **выбор персистится** (`mxtr-cloak.idx` рядом с
 PSK, restart сохраняет identity):
@@ -211,7 +213,7 @@ HKDF-SHA256(
 )  ->  16 bytes  ->  разбивается на:
 
   out[0]                     -> camouflage_template_idx  (nginx|apache|litespeed|caddy|cloudflare|stdlib)
-  out[1] & 1                 -> alpn_order               (h2,http/1.1 | http/1.1,h2)
+  out[1]                     -> (reserved; ALPN is http/1.1-only now)
   20_000 + out[2]*100        -> heartbeat_min_ms         (20.0-45.5s)
   45_000 + out[3]*100        -> heartbeat_max_ms         (45.0-70.5s)
   32 + out[4]                -> heartbeat_pad_min        (32-287 bytes)
@@ -219,9 +221,9 @@ HKDF-SHA256(
   10_000 + out[8]*50         -> idle_threshold_ms        (10.0-22.75s)
 ```
 
-Два разных деплоя, разные PSK -> разный порядок ALPN, разная cadence
-heartbeat. Pattern-detector, обученный на одном deployment'е, не
-покрывает другой.
+Два разных деплоя, разные PSK -> разная cadence heartbeat и padding.
+Pattern-detector, обученный на одном deployment'е, не покрывает другой.
+(ALPN больше не варьируется - всегда http/1.1, см. TLS layer.)
 
 Camouflage family НЕ PSK-derived в текущей версии: выбор делается
 crypto/rand на первом startup и **персистится** на диск. Это нужно
@@ -239,8 +241,8 @@ crypto/rand на первом startup и **персистится** на дис�
 
 | Зонд                                | Ответ сервера                                |
 |-------------------------------------|----------------------------------------------|
-| `curl https://host:<port>/`         | TLS-1.3 + h2 + случайно 403/404/500 одного из 6 семейств, headers совпадают с тем что реально отдаёт это family |
-| `curl https://host:<port>/robots.txt` | TLS-1.3 + h2 + 200 + `User-agent: *\nDisallow:\n` |
+| `curl https://host:<port>/`         | TLS-1.3 + http/1.1 + случайно 403/404/500 одного из 6 семейств, headers совпадают с тем что реально отдаёт это family |
+| `curl https://host:<port>/robots.txt` | TLS-1.3 + http/1.1 + 200 + `User-agent: *\nDisallow:\n` |
 | `nc host <port>` + случайные байты  | TLS-1.3 -> `400 Bad Request` семейства + close |
 | Правильный mxtr-handshake (wrong PSK)| TLS -> читает MAC -> fail -> `400 Bad Request` + close |
 | TLS handshake без SNI               | принимаем, отдаём cert (SNI tolerant)        |

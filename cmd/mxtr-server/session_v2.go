@@ -333,10 +333,10 @@ func handleTCPv2(conn net.Conn) {
 	nonceC, raw, err := readClientHandshake(conn)
 	if err != nil {
 		if looksLikeHTTP(raw) {
-			logInfof("[v2-%d] http probe from %s; serving 500", id, conn.RemoteAddr())
-			drainHTTPRequest(conn, raw)
+			path := drainHTTPRequest(conn, raw)
+			logInfof("[v2-%d] http probe from %s (%q); serving camouflage", id, conn.RemoteAddr(), path)
 			conn.SetDeadline(time.Now().Add(5 * time.Second))
-			_, _ = conn.Write(pickCamouflage())
+			_, _ = conn.Write(camouflageForPath(path))
 			return
 		}
 		// Non-mxtr bytes after TLS: either random garbage or a wrong-PSK

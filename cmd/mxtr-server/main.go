@@ -33,7 +33,6 @@ import (
 	mrand "math/rand/v2"
 	"bytes"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -41,7 +40,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/http2"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
@@ -614,10 +612,26 @@ func looksLikeHTTP(buf []byte) bool {
 	return false
 }
 
-func drainHTTPRequest(conn net.Conn, prefix []byte) {
+// drainHTTPRequest reads the rest of an HTTP request (prefix holds the bytes
+// already consumed) up to the blank line ending the headers, so the socket is
+// positioned for a clean camouflage reply. It returns the request path parsed
+// from the first line (best-effort; "" if unparseable) so callers can answer
+// path-aware (e.g. /robots.txt). Bounded by maxHTTPHeaderRead.
+func drainHTTPRequest(conn net.Conn, prefix []byte) string {
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 	var s int
-	for _, b := range prefix {
+	firstLine := make([]byte, 0, 64)
+	lineDone := false
+	// step feeds one byte through the first-line capture and the CRLFCRLF
+	// end-of-headers state machine; returns true once the blank line is seen.
+	step := func(b byte) bool {
+		if !lineDone {
+			if b == '\n' {
+				lineDone = true
+			} else if b != '\r' && len(firstLine) < 256 {
+				firstLine = append(firstLine, b)
+			}
+		}
 		switch b {
 		case '\r':
 			if s == 0 || s == 2 {
@@ -629,13 +643,19 @@ func drainHTTPRequest(conn net.Conn, prefix []byte) {
 			if s == 1 || s == 3 {
 				s++
 				if s == 4 {
-					return
+					return true
 				}
 			} else {
 				s = 0
 			}
 		default:
 			s = 0
+		}
+		return false
+	}
+	for _, b := range prefix {
+		if step(b) {
+			return httpRequestPath(firstLine)
 		}
 	}
 	one := make([]byte, 1)
@@ -643,29 +663,24 @@ func drainHTTPRequest(conn net.Conn, prefix []byte) {
 	for read < maxHTTPHeaderRead {
 		n, err := conn.Read(one)
 		if err != nil || n == 0 {
-			return
+			return httpRequestPath(firstLine)
 		}
 		read++
-		switch one[0] {
-		case '\r':
-			if s == 0 || s == 2 {
-				s++
-			} else {
-				s = 1
-			}
-		case '\n':
-			if s == 1 || s == 3 {
-				s++
-				if s == 4 {
-					return
-				}
-			} else {
-				s = 0
-			}
-		default:
-			s = 0
+		if step(one[0]) {
+			return httpRequestPath(firstLine)
 		}
 	}
+	return httpRequestPath(firstLine)
+}
+
+// httpRequestPath extracts the request-target from an HTTP request line such
+// as "GET /robots.txt HTTP/1.1". Returns "" if the line is malformed.
+func httpRequestPath(line []byte) string {
+	fields := strings.Fields(string(line))
+	if len(fields) >= 2 {
+		return fields[1]
+	}
+	return ""
 }
 
 // readClientHandshake reads the variable-length client handshake from conn:
@@ -995,11 +1010,12 @@ func runTCP(addr string, handler func(net.Conn), label string) {
 		// legacy extensions. Smaller fingerprint surface for DPI to match.
 		MinVersion: tls.VersionTLS13,
 		MaxVersion: tls.VersionTLS13,
-		// Per-PSK ALPN ordering — see pskDerivedConfig.alpnOrder. Both "h2"
-		// and "http/1.1" are always offered; the order is shuffled per PSK so
-		// different deployments don't share an identical ServerHello ALPN
-		// extension payload. Kotlin mxtr client sends no ALPN extension so
-		// server falls through to "" for those conns; dispatchTLSConn routes.
+		// http/1.1 only (pskDerivedConfig.alpnOrder). We deliberately do NOT
+		// offer h2: an h2 probe would be served by a Go http2.Server whose
+		// SETTINGS frame fingerprints the box as Go, contradicting the
+		// nginx/cloudflare camouflage. The Kotlin mxtr client sends no ALPN
+		// extension anyway, so real traffic never negotiates a protocol;
+		// dispatchTLSConn hands every conn to the mxtr handler post-handshake.
 		NextProtos: pskCfg.alpnOrder,
 		// Modern CDN posture: Cloudflare disables session tickets by default
 		// since 2018 to provide forward secrecy. Matching that here both
@@ -1057,13 +1073,13 @@ func underlyingTCP(c net.Conn) (*net.TCPConn, bool) {
 	return nil, false
 }
 
-// dispatchTLSConn forces the TLS handshake so we can inspect the negotiated
-// ALPN before deciding what to do with the bytes that follow. mxtr clients do
-// not advertise ALPN, so the server-side selection ends up empty for them and
-// we hand the raw byte stream to the mxtr handler. Browsers will pick "h2" out
-// of our offered list and we feed those conns into a real http2.Server that
-// answers with the pinned 500 camouflage — no protocol error, just a normal
-// "this server is having a bad day" page.
+// dispatchTLSConn forces the TLS handshake, then hands every connection to the
+// mxtr handler. We only offer http/1.1 in ALPN (no h2), so there is no
+// protocol to branch on: real mxtr clients send no ALPN and ride the mxtr
+// handler; HTTP probes that negotiated http/1.1 hit the camouflage inside the
+// same handler (readClientHandshake -> looksLikeHTTP). An h2-only ClientHello
+// has no shared protocol and Go fails the handshake with no_application_protocol
+// below, exactly as a real http/1.1-only server would.
 func dispatchTLSConn(c net.Conn, mxtrHandler func(net.Conn), label string) {
 	tlsConn, ok := c.(*tls.Conn)
 	if !ok {
@@ -1083,86 +1099,51 @@ func dispatchTLSConn(c net.Conn, mxtrHandler func(net.Conn), label string) {
 		tlsConn.Close()
 		return
 	}
-	switch tlsConn.ConnectionState().NegotiatedProtocol {
-	case "h2":
-		serveH2Camouflage(tlsConn, label)
-	default:
-		mxtrHandler(tlsConn)
-	}
+	mxtrHandler(tlsConn)
 }
 
-// camouflageHTTPHandler answers each request with a random 403/404/500
-// drawn from the pinned family. Path-aware shortcuts: real production
-// servers respond to /robots.txt and /favicon.ico with distinctive replies
-// (200 short body, 404 short body), so a probe asking only for / and
-// always getting 5xx from a server that supposedly has robots.txt is a
-// mild tell. Adding the two common-path responders closes that gap with
-// minimal code.
-var camouflageHTTPHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-	t := pickCamouflageTemplate()
-	if t.server != "" {
-		w.Header().Set("Server", t.server)
+// renderRobots builds a realistic `200 OK` robots.txt reply for the pinned
+// family. Real public-facing servers answer /robots.txt with a body; an empty
+// disallow-nothing is the most common shape. Hand-rolled bytes (not Go
+// net/http) so the response carries no Go stack fingerprint.
+func renderRobots(fam *camouflageFamily) []byte {
+	body := []byte("User-agent: *\nDisallow:\n")
+	date := time.Now().UTC().Format(time.RFC1123)
+	var b []byte
+	b = append(b, "HTTP/1.1 200 OK\r\n"...)
+	if fam.server != "" {
+		b = append(b, "Server: "...)
+		b = append(b, fam.server...)
+		b = append(b, "\r\n"...)
 	}
-	for _, h := range t.extraHeaders {
-		idx := strings.Index(h, ": ")
-		if idx > 0 {
-			w.Header().Set(h[:idx], h[idx+2:])
-		}
+	b = append(b, "Date: "...)
+	b = append(b, date...)
+	b = append(b, "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: "...)
+	b = append(b, strconv.Itoa(len(body))...)
+	b = append(b, "\r\n"...)
+	for _, h := range fam.extraHeaders {
+		b = append(b, h...)
+		b = append(b, "\r\n"...)
 	}
-	// /robots.txt — real public servers always answer with a body. Empty
-	// disallow-nothing is the most common shape.
-	if r.URL.Path == "/robots.txt" {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		body := []byte("User-agent: *\nDisallow:\n")
-		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
-		return
-	}
-	// /favicon.ico — nginx/Apache default to 404 unless explicitly
-	// configured. That matches what we want to return for any other
-	// "unknown" probe path anyway.
-	status := pickRandomStatus()
-	body := t.statusBodies[status]
-	if body == nil {
-		body = t.statusBodies[500]
-	}
-	w.Header().Set("Content-Type", t.contentType)
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
-})
-
-// h2Server is reused across all conns so we don't allocate one per request.
-// MaxConcurrentStreams=10 mimics a small backend; IdleTimeout cleans up
-// browsers that hold the connection open after seeing the 500.
-var h2Server = &http2.Server{
-	MaxConcurrentStreams: 10,
-	// IdleTimeout bounds gap between requests; the conn-wide deadline below
-	// bounds total time. Real CDNs cut probes that don't ask for anything
-	// useful well below 30s.
-	IdleTimeout: 15 * time.Second,
+	b = append(b, "Connection: close\r\n\r\n"...)
+	b = append(b, body...)
+	return b
 }
 
-// h2CamouflageHardDeadline bounds total time spent serving any single
-// camouflage probe (L2-02). h2Server.ServeConn would otherwise honour MaxConcurrentStreams=10
-// indefinitely if the attacker keeps pipelining requests.
-const h2CamouflageHardDeadline = 30 * time.Second
-
-func serveH2Camouflage(tlsConn *tls.Conn, label string) {
-	logInfof("%s h2 probe from %s; serving 500", label, tlsConn.RemoteAddr())
-	_ = tlsConn.SetDeadline(time.Now().Add(h2CamouflageHardDeadline))
-	h2Server.ServeConn(tlsConn, &http2.ServeConnOpts{
-		Handler: camouflageHTTPHandler,
-	})
-	_ = tlsConn.Close()
+// camouflageForPath answers an HTTP probe path-aware: /robots.txt gets a
+// realistic 200, every other path the random 4xx/5xx of the pinned family.
+func camouflageForPath(path string) []byte {
+	if path == "/robots.txt" {
+		return renderRobots(pickCamouflageTemplate())
+	}
+	return pickCamouflage()
 }
 
 
 // version is the build version. Release builds override it via
 // -ldflags "-X main.version=<tag>" (see .github/workflows/release.yml);
 // the default below is the in-repo development version.
-var version = "0.2.2"
+var version = "0.2.3"
 
 func main() {
 	var (

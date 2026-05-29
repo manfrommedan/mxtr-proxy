@@ -102,7 +102,7 @@ PSK, target-allowlist, compose, LE-сертификат) - см.
   старый трафик не расшифровывает: AEAD-ключи привязаны к nonce,
   которые внутри outer-TLS, без TLS-ключей их не достать.
 - ТСПУ не банит «класс mxtr-серверов» одним правилом. PSK через HKDF
-  выводит порядок ALPN и cadence heartbeat. Cloak family (одно из 6:
+  выводит cadence heartbeat. Cloak family (одно из 6:
   nginx/Apache/LiteSpeed/Caddy/cloudflare/Go-stdlib) и cert CN
   (нейтральный синтетический из ~6.7 млн имён, не под конкретный CDN)
   выбираются на первом старте и персистятся - у каждого деплоя свой

@@ -40,10 +40,11 @@ func derivePskConfig(psk []byte) pskDerivedConfig {
 		panic("hkdf read: " + err.Error())
 	}
 
-	alpn := []string{"h2", "http/1.1"}
-	if out[1]&1 == 1 {
-		alpn = []string{"http/1.1", "h2"}
-	}
+	// HTTP/1.1 only: we deliberately do NOT offer h2. An h2 probe would be
+	// routed into a Go http2.Server whose SETTINGS frame fingerprints the box
+	// as Go, contradicting the nginx/cloudflare camouflage. TCP/1.1-only is an
+	// ordinary server posture and leaks no stack identity through ALPN.
+	alpn := []string{"http/1.1"}
 
 	return pskDerivedConfig{
 		alpnOrder:        alpn,

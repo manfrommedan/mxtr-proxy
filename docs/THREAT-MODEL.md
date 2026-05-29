@@ -14,13 +14,13 @@ mxtr-proxy спроектирован против конкретных прот
 инфраструктурный hostname (`srv<N>-<region>.hosted-edge.net` /
 `node-<region>-<N>.vmpool-cloud.com` и т.д., несколько млн возможных
 значений, **не под конкретный CDN**, выбирается на VPS при первом старте и
-персистится). ServerHello с cert subject = тому же hostname. ALPN h2 +
-http/1.1. Дальше - случайные байты с распределением как у нормального
-HTTPS-трафика.
+персистится). ServerHello с cert subject = тому же hostname. ALPN
+http/1.1 (h2 намеренно не предлагается - иначе h2-стек выдал бы Go).
+Дальше - случайные байты с распределением как у нормального HTTPS-трафика.
 
 **Защита**:
 
-- Per-PSK randomisation ALPN-порядка и heartbeat cadence.
+- Per-PSK randomisation heartbeat cadence и padding (ALPN всегда http/1.1).
 - Per-host persisted identity: cloak family (один из 6: nginx, Apache,
   LiteSpeed, Caddy, cloudflare, Go-stdlib) и cert CN выбираются один
   раз и сохраняются на диск. Restart не меняет identity - реальный

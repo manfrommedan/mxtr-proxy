@@ -36,9 +36,9 @@ libraries/matrix/impl/src/main/kotlin/io/element/android/libraries/matrix/impl/m
 │                              #   (auto-fallback 1984..1993 если первый занят)
 ├── MxtrCrypto.kt              # HKDF, AEAD wrap/unwrap, TLS-1.3 SSLContext;
 │                              #   trust manager принимает EC + RSA leaf (для real LE-cert)
-├── MxtrHttpProxy.kt           # HTTP CONNECT-листенер + bindWithFallback по портам
+├── MxtrHttpProxy.kt           # HTTP CONNECT-листенер на случайном эфемерном порту
 ├── MxtrPreferencesStore.kt    # DataStore с enabled/share-string
-├── MxtrPskDerivedConfig.kt    # из PSK выводим ALPN/heartbeat (camouflage больше не PSK-derived)
+├── MxtrPskDerivedConfig.kt    # из PSK выводим heartbeat cadence (ALPN фиксирован http/1.1)
 ├── MxtrSession.kt             # TLS+handshake, reader/heartbeat threads;
 │                              #   connect(sni=...) ставит SNI в outer ClientHello;
 │                              #   13-rung PADME padding ladder + size-scaled bump
