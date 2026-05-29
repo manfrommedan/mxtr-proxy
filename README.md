@@ -49,10 +49,7 @@ IPv4 и `<port>` на любой свободный порт (примеры н�
 placeholder - выбирай нестандартный, не 443/80/22):
 
 ```bash
-docker run -d --name mxtr-proxy --restart unless-stopped --network host \
-  -v /opt/mxtr-proxy/state:/state \
-  ghcr.io/manfrommedan/mxtr-proxy:latest \
-  -tcp :<port> -public-ip <vps-ip> -psk-file /state/psk.hex
+docker run -d --name mxtr-proxy --restart unless-stopped --network host -v /opt/mxtr-proxy/state:/state ghcr.io/manfrommedan/mxtr-proxy:latest -tcp :<port> -public-ip <vps-ip> -psk-file /state/psk.hex
 sleep 2 && docker logs mxtr-proxy 2>&1 | grep share-string
 ```
 
