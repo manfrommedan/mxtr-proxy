@@ -119,9 +119,10 @@ mxtr из PSK через HKDF выводит:
   рядом с PSK. Restart сохраняет identity (реальный nginx тоже не меняет
   500-страницу при рестарте, ротация identity на каждый запуск -
   сама по себе признак подмены).
-- TLS cert CN - синтетический CDN-edge name из ~1.8 млн комбинаций
-  (60 cities × 7 CDN patterns × 99 number positions), персистится.
-  Restart не меняет subject - cert тоже выглядит стабильным.
+- TLS cert CN - нейтральный синтетический hostname из ~6.7 млн комбинаций
+  (16 apex-доменов × 7 форм субдомена × 60 регионов × 999 чисел), не под
+  конкретный CDN, персистится. Restart не меняет subject - cert тоже
+  выглядит стабильным.
 - `-rotate-cloak` форсирует пересборку обоих одновременно: оператор
   выбирает когда менять identity.
 
@@ -147,13 +148,15 @@ headers (`Cache-Control`+`Vary` у Cloudflare,
 production `server_tokens off`/`ServerSignature Off`.
 
 Path-aware: `/robots.txt` отвечает 200 с реалистичным телом
-`User-agent: *\nDisallow:\n`. Real CDN edge всегда так делает на
-public-facing порту, и мы тоже отвечаем.
+`User-agent: *\nDisallow:\n`. Реальный public-facing сервер всегда так
+делает, и мы тоже отвечаем.
 
 `curl -ksv https://<vps-ip>:<port>/` от зеваки даёт случайно
 выбранный 4xx/5xx правдоподобной структуры. Если зондирование
-приходит как НЕ-HTTP байтопоток - 60-секундный hang, что дороже
-одного зонда, чем РКН готов потратить.
+приходит как НЕ-HTTP байтопоток (или mxtr-handshake с неверным PSK) -
+`400 Bad Request` выбранного семейства + close, ровно как реальный
+nginx/Apache на кривой запрос. Раньше тут был 60-секундный silent-hang,
+но молчание само по себе отличало нас от заявленного сервера - убрали.
 
 ### 4. Stream multiplexing на один TLS-сокет
 
@@ -266,10 +269,12 @@ alexbers/mtprotoproxy умеет 1 порт = N secrets. Это пока в road
   траффика (добавление латентности, что для матрикса неприемлемо).
 - **Probe-resistant proxy detection** (Frolov et al., NDSS 2020) -
   timeout + byte threshold распознают proxies, которые молчат при
-  невалидном зонде. MTProxy уязвим, mxtr частично компенсируется
-  camouflage HTTP (6 семейств, random 403/404/500, path-aware /robots.txt
-  отвечает 200) - но не до конца, активный probe всё равно может различить
-  статичный-camouflage от реального CDN edge.
+  невалидном зонде. MTProxy уязвим. mxtr на любой невалидный зонд отвечает
+  как реальный сервер: HTTP-проба -> 403/404/500, не-HTTP мусор и неверный
+  PSK -> `400 Bad Request` + close (раньше тут был silent-hang - убрали,
+  молчание само по себе и есть тот сигнал по Frolov). path-aware
+  /robots.txt отвечает 200. Остаточный риск: статичный camouflage активный
+  probe всё равно может отличить от полноценного веб-стека.
 
 ## Сводная таблица
 
@@ -279,8 +284,8 @@ alexbers/mtprotoproxy умеет 1 порт = N secrets. Это пока в road
 | Серверный язык / runtime | C (offic.) / Go (mtg) / Rust+Tokio (telemt) / Python (alexbers) | Go |
 | Стейт серверного code-base | официальный заброшен Telegram, живут форки | актив |
 | Outer layer | fake-TLS (имитация) | настоящий TLS-1.3 |
-| Ответ на зондирование | timeout / hang (offic., alexbers) -> real TLS splice (telemt) | случайно 403/404/500 одного из 6 семейств + path-aware /robots.txt=200 |
-| Cert subject | один на весь deploy | synthetic из ~1.8M space, persisted per host |
+| Ответ на зондирование | timeout / hang (offic., alexbers) -> real TLS splice (telemt) | HTTP-проба: 403/404/500 одного из 6 семейств; не-HTTP / неверный PSK: 400 Bad Request + close; /robots.txt=200 |
+| Cert subject | один на весь deploy | нейтральный synthetic из ~6.7M space (не под CDN), persisted per host |
 | SNI tracking | не явно адресовано | SNI=cert subject в share-string, нет признака domain fronting |
 | Stream mux | нет | да |
 | Padding | случайный +0..15B (mtg) | 13-rung PADME ladder + size-scaled bump (30/18/8%) |

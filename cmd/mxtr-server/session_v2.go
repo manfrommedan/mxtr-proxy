@@ -339,8 +339,16 @@ func handleTCPv2(conn net.Conn) {
 			_, _ = conn.Write(pickCamouflage())
 			return
 		}
-		logInfof("[v2-%d] bad PSK from %s; hanging", id, conn.RemoteAddr())
-		time.Sleep(probeHangDuration)
+		// Non-mxtr bytes after TLS: either random garbage or a wrong-PSK
+		// handshake whose MAC failed. A real nginx/Apache answers malformed
+		// input with 400 Bad Request and closes -- it does NOT hang silently,
+		// so the previous 60s silent hang was itself a fingerprint a prober
+		// could use to tell mxtr from the CDN it claims to be. Mirror the
+		// pinned family's 400 page and close. This trades the mass-scan cost
+		// amplification of the old hang for camouflage consistency.
+		logInfof("[v2-%d] non-mxtr bytes from %s; serving 400", id, conn.RemoteAddr())
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		_, _ = conn.Write(renderCamouflage(pickCamouflageTemplate(), 400))
 		return
 	}
 

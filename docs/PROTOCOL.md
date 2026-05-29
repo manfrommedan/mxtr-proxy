@@ -25,20 +25,26 @@ TLS-1.3 only (`enabledProtocols=["TLSv1.3"]` на клиенте и сервер
 умолчанию self-signed cert; опционально - реальный LE-cert через
 `-cert/-key` (RSA или EC, клиент принимает оба).
 
-**Self-signed CN** генерится из синтетического пула ~1.8 млн имён по 7
-реальным CDN-шаблонам (`<region><N>.edge.fastly.net`,
-`node-<city>-<N>.bunnycdn.com`, `a<N>.<city>.edge.akamaiedge.net` и
-т.д.). RKN не может составить словарь - сетку из ~10 fixed имён мы
-выбросили. Выбранное имя **персистится** в файл рядом с PSK (по умолчанию
-`./mxtr-cert.cn`), рестарт сохраняет identity. `-rotate-cloak` форсирует
-переброс.
+**Self-signed CN** генерится из синтетического пула в несколько млн
+**нейтральных инфраструктурных** имён (`srv<N>-<region>.hosted-edge.net`,
+`node-<region>-<N>.vmpool-cloud.com`, `edge-<region><N>.netregion-hosting.io`
+и т.д. - apex x форма x регион x число). Раньше пул имитировал реальные
+CDN (`*.edge.fastly.net`, `*.akamaiedge.net`), но это оказалось не
+маскировкой, а обузой: такие имена резолвятся в опубликованные anycast-
+диапазоны CDN, и цензор, резолвя SNI, видит заявку на Fastly при том что
+dst-IP - обычный VPS в хостинг-ASN (проверяемая ложь), а self-signed серт
+с именем настоящего CDN в природе невозможен (CDN всегда отдают CA-валид).
+Нейтральные имена дают NXDOMAIN / ничего примечательного вместо пойманной
+подделки, RKN всё так же не может составить словарь. Выбранное имя
+**персистится** в файл рядом с PSK (по умолчанию `./mxtr-cert.cn`), рестарт
+сохраняет identity. `-rotate-cloak` форсирует переброс.
 
 **SNI в ClientHello** = тот же CN (передаётся через `?sni=<cn>` в
 share-string). Сервер представляет cert с тем же subject. Совпадение
 SNI/cert на wire - нет "SNI≠cert" тели, которую TSPU отслеживает с 2022.
 
 ALPN: server предлагает `h2,http/1.1` (порядок выбирается из PSK).
-Так пассивный наблюдатель видит обычный CDN, отдающий HTTP/2.
+Так пассивный наблюдатель видит обычный HTTPS-сервер, отдающий HTTP/2.
 
 Аутентификация - **не** через X509, а через PSK-HMAC внутри handshake
 (см. ниже). Клиент проверяет в cert только: chain не пустой, не
@@ -75,9 +81,13 @@ K_s2c = HKDF-SHA256(PSK, nonce_c || nonce_s, info="s2c-key")[:32]
 seq_c = 0, seq_s = 0
 ```
 
-Если HMAC сервера не совпал у клиента (или наоборот) - сторона рвёт
-TLS-соединение **без** ответного сообщения. Активный зонд получит
-60-секундный hang (`probeHangDuration`) и не узнает, что попал на mxtr.
+Если HMAC сервера не совпал у клиента - клиент рвёт TLS **без** ответа.
+На стороне сервера невалидный mxtr-handshake (неверный PSK) или просто
+не-HTTP мусор после TLS получает `400 Bad Request` выбранного
+camouflage-семейства + `Connection: close` - ровно как реальный
+nginx/Apache на кривой запрос. Раньше сервер тут молча висел 60 секунд,
+но это само по себе было tell: настоящий сервер на таймауте шлёт 408/400,
+а не тишину. См. «Активный зонд».
 
 ## Frame format
 
@@ -231,8 +241,8 @@ crypto/rand на первом startup и **персистится** на дис�
 |-------------------------------------|----------------------------------------------|
 | `curl https://host:<port>/`         | TLS-1.3 + h2 + случайно 403/404/500 одного из 6 семейств, headers совпадают с тем что реально отдаёт это family |
 | `curl https://host:<port>/robots.txt` | TLS-1.3 + h2 + 200 + `User-agent: *\nDisallow:\n` |
-| `nc host <port>` + случайные байты  | TLS-1.3 handshake -> дальше hang 60с          |
-| Правильный mxtr-handshake (wrong PSK)| TLS -> читает MAC -> fail -> hang 60с          |
+| `nc host <port>` + случайные байты  | TLS-1.3 -> `400 Bad Request` семейства + close |
+| Правильный mxtr-handshake (wrong PSK)| TLS -> читает MAC -> fail -> `400 Bad Request` + close |
 | TLS handshake без SNI               | принимаем, отдаём cert (SNI tolerant)        |
 | TLS handshake с любым SNI           | принимаем, отдаём cert (один cert на listener)|
 
@@ -275,10 +285,10 @@ identity.
   плохо: чистая TLS-1.3 без GREASE сама по себе чуть-чуть выделяется
   на фоне Chrome/Firefox). На Android API 29+ JSSE = Conscrypt, который
   GREASE отдаёт - но не на всех версиях ровно.
-- Не делает domain fronting через CDN. Камуфляж - synthetic CN +
-  camouflage HTTP + persisted identity. SNI совпадает с cert: domain
-  fronting (SNI≠cert) - **классический признак**, который ТСПУ
-  читает с 2022, мы его избегаем.
+- Не делает domain fronting через CDN. Камуфляж - нейтральный synthetic
+  CN (не под конкретный CDN) + camouflage HTTP + persisted identity. SNI
+  совпадает с cert: domain fronting (SNI≠cert) - **классический признак**,
+  который ТСПУ читает с 2022, мы его избегаем.
 - Не делает TCP-splice cloak до реального сайта (как `telemt`). Для
   personal-VPS избыточно.
 - Не имеет congestion-control сверх TCP. Один сокет = одно окно. При

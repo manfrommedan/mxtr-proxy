@@ -291,9 +291,9 @@ scope.launch {
   push-через-proxy - надо переходить на NTFY / собственный
   push-gateway.
 - Не пытайся проверять TLS-cert сервера через стандартный X509.
-  Сертификат сервера self-signed by design (CN из ~1.8 млн
-  synthetic CDN-edge namespace, выбирается на первом старте и
-  персистится). Аутентификация - через PSK-HMAC, она происходит
+  Сертификат сервера self-signed by design (CN из ~6.7 млн
+  нейтральных synthetic hostname'ов, не под конкретный CDN, выбирается
+  на первом старте и персистится). Аутентификация - через PSK-HMAC, она происходит
   **после** TLS handshake. Trust manager делает только sanity-check:
   chain не пустой, не просрочен, алгоритм EC или RSA (RSA нужен
   чтобы реальный LE-cert через `-cert/-key` тоже работал, дефолтный

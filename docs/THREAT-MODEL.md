@@ -10,9 +10,10 @@ mxtr-proxy спроектирован против конкретных прот
 по большому корпусу легитимного и подозрительного трафика. **Не может**
 выборочно вмешиваться в реальном времени (только block по правилу).
 
-**Что видит**: TLS-1.3 ClientHello с SNI = synthetic CDN-edge hostname
-(`<region><N>.edge.fastly.net` / `node-<city>-<N>.bunnycdn.com` и т.д.,
-~1.8M возможных значений, выбирается на VPS при первом старте и
+**Что видит**: TLS-1.3 ClientHello с SNI = нейтральный синтетический
+инфраструктурный hostname (`srv<N>-<region>.hosted-edge.net` /
+`node-<region>-<N>.vmpool-cloud.com` и т.д., несколько млн возможных
+значений, **не под конкретный CDN**, выбирается на VPS при первом старте и
 персистится). ServerHello с cert subject = тому же hostname. ALPN h2 +
 http/1.1. Дальше - случайные байты с распределением как у нормального
 HTTPS-трафика.
@@ -41,8 +42,10 @@ HTTPS-трафика.
   старых обходов цензуры. ТСПУ научилось отслеживать этот
   раскоррелированный сигнал с 2022, такие соединения режутся
   быстрее обычных. Мы шлём в SNI ровно то же, что у cert subject, и
-  оба - синтетический CDN-edge hostname, выглядим как обычный
-  одиночный VPS на дефолт-cert'е.
+  оба - нейтральный синтетический hostname (не под конкретный CDN),
+  выглядим как обычный одиночный VPS на дефолт-cert'е. Раньше тут
+  имитировался конкретный CDN (`*.fastly.net`), но это давало
+  проверяемую SNI-vs-ASN ложь - отказались.
 
 **Чего не делает**: GREASE-extensions в TLS-1.3. Чистая Java TLS-1.3 без
 GREASE на фоне Chrome выделяется (Chrome всегда добавляет GREASE). На
@@ -66,9 +69,9 @@ TLS-handshake без полезных данных, или как попытка
 |-------------------------------------|------------------------------------------------|
 | `curl https://host:<port>/`         | TLS-1.3 + случайно 403/404/500 одного из 6 семейств + family-specific headers и body |
 | `curl https://host:<port>/robots.txt` | TLS-1.3 + 200 + `User-agent: *\nDisallow:\n` |
-| `nc host <port>` + случайные байты  | TLS-handshake -> дальше hang 60 секунд          |
+| `nc host <port>` + случайные байты  | TLS -> `400 Bad Request` семейства + close       |
 | Telnet до timeout                   | пустой TLS-handshake -> drop                    |
-| Правильный handshake, неверный PSK  | TLS -> mxtr handshake -> HMAC fail -> hang 60с    |
+| Правильный handshake, неверный PSK  | TLS -> mxtr handshake -> HMAC fail -> `400 Bad Request` + close |
 
 **Защита**:
 
@@ -86,10 +89,15 @@ TLS-handshake без полезных данных, или как попытка
   `User-agent: *\nDisallow:\n` - как у любого public-facing HTTP-сервера.
   Остальные пути идут через рандомизатор 403/404/500. Разные пути -
   разные ответы, как у реального веб-сервера.
-- 60-секундный hang при невалидных байтах **И** при HMAC-fail - один
-  зондирующий запрос занимает fd на минуту, для massive scanning
-  стоимость растёт линейно.
-- Cert subject - synthetic из ~1.8M space, не enumerable dictionary.
+- На невалидные байты **И** на HMAC-fail сервер отвечает `400 Bad Request`
+  выбранного семейства + `Connection: close` - как реальный nginx/Apache
+  на кривой запрос. Раньше тут был 60-секундный silent-hang (удорожал
+  массовый скан), но молчаливое зависание само отличало нас от заявленного
+  сервера: настоящий nginx на таймауте шлёт 408/400, а не тишину.
+  Сознательный размен - консистентность камуфляжа важнее анти-скан
+  удорожания.
+- Cert subject - нейтральный synthetic hostname из пространства в
+  несколько млн, не enumerable dictionary, не под конкретный CDN.
   Cloak family и cert CN persisted - rotation across restarts не
   выдаёт паттерн (`-rotate-cloak` форсирует когда оператор сам решит).
 

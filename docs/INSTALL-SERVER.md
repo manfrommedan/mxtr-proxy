@@ -97,7 +97,7 @@ cloak family + cert CN персистятся в `/state/` и переживаю
 /opt/mxtr-proxy/state/
 ├── psk.hex            # PSK, 64 hex chars + \n, chmod 600
 ├── mxtr-cloak.idx     # camouflage family index (0..5)
-└── mxtr-cert.cn       # synthetic CDN-edge CN для self-signed cert
+└── mxtr-cert.cn       # нейтральный synthetic CN для self-signed cert
 ```
 
 Все файлы создаются с `O_CREATE|O_EXCL|O_NOFOLLOW` + atomic rename -
@@ -130,8 +130,8 @@ docker logs mxtr-proxy | grep share-string  # получить новый
 
 ### Реальный LE-cert
 
-По умолчанию self-signed cert с synthetic CN
-(`<region><N>.edge.fastly.net` и т.д.). Если хочется реальный
+По умолчанию self-signed cert с нейтральным synthetic CN
+(`srv<N>-<region>.hosted-edge.net` и т.д., не под конкретный CDN). Если хочется реальный
 Let's Encrypt - получи cert на свой домен, прокинь файлы внутрь
 контейнера, добавь `-cert/-key/-sni`:
 
@@ -217,7 +217,7 @@ mkdir -p /var/lib/mxtr && chmod 700 /var/lib/mxtr
 ## Проверка работы
 
 ```bash
-# 1. Активное зондирование: сервер должен прикинуться cdn-edge с 4xx/5xx.
+# 1. Активное зондирование: сервер должен прикинуться обычным веб-сервером с 4xx/5xx.
 curl -ksv https://<vps-ip>:<port>/
 # HTTP/2 403 (или 404, или 500) + server: nginx (или один из 6 семейств)
 # date: <текущее UTC>
@@ -250,9 +250,12 @@ curl --socks5 127.0.0.1:1984 https://matrix.org/_matrix/client/versions
   блокировал. Проблема: РКН ТСПУ с 2022 года активно ищет именно этот
   паттерн "SNI не совпадает с cert subject" - и режет такие соединения
   быстрее обычных. Мы намеренно делаем наоборот: SNI=cert subject, оба -
-  наш synthetic CDN-edge hostname. Снаружи это выглядит как обычный
-  мелкий VPS с дефолт-cert nginx на своём собственном hostname - тех
-  миллионы. DPI-устойчивость держится не на маскировке под чужой домен,
-  а на synthetic CN из ~1.8M space + camouflage HTTP + persisted identity.
+  наш нейтральный synthetic hostname (не под конкретный CDN). Снаружи это
+  выглядит как обычный мелкий VPS с дефолт-cert на своём собственном
+  hostname - тех миллионы. Имитировать конкретный CDN мы намеренно
+  перестали: имя вроде `*.fastly.net` резолвится в чужой anycast-ASN и
+  даёт цензору проверяемую SNI-vs-ASN ложь. DPI-устойчивость держится не
+  на маскировке под чужой домен, а на нейтральном synthetic CN
+  (~6.7M space) + camouflage HTTP + persisted identity.
 - Не экспортит метрики и не телеметрит. Никаких outbound-соединений,
   кроме тех, что инициировал клиент через CONNECT.

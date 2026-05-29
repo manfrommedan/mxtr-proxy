@@ -78,7 +78,6 @@ const (
 	// state; 8192 ~= 80 MiB ceiling, well under VPS-class memory budgets.
 	// At scale this needs `ulimit -n` >= 65536 and tcp_max_orphans tuning.
 	maxConcurrentConns = 8192
-	probeHangDuration = 60 * time.Second
 	dialTimeout       = 10 * time.Second
 	maxHTTPHeaderRead = 8192
 
@@ -363,6 +362,7 @@ var camouflageFamilies = []camouflageFamily{
 		contentType:  "text/html",
 		extraHeaders: []string{},
 		statusBodies: map[int][]byte{
+			400: htmlBody("400 Bad Request", "400 Bad Request", "", "nginx"),
 			403: htmlBody("403 Forbidden", "403 Forbidden", "", "nginx"),
 			404: htmlBody("404 Not Found", "404 Not Found", "", "nginx"),
 			500: htmlBody("500 Internal Server Error", "500 Internal Server Error", "", "nginx"),
@@ -373,6 +373,7 @@ var camouflageFamilies = []camouflageFamily{
 		contentType:  "text/html; charset=iso-8859-1",
 		extraHeaders: []string{},
 		statusBodies: map[int][]byte{
+			400: []byte("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>400 Bad Request</title>\n</head><body>\n<h1>Bad Request</h1>\n<p>Your browser sent a request that this server could not understand.</p>\n</body></html>\n"),
 			403: []byte("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>403 Forbidden</title>\n</head><body>\n<h1>Forbidden</h1>\n<p>You don't have permission to access this resource.</p>\n</body></html>\n"),
 			404: []byte("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>404 Not Found</title>\n</head><body>\n<h1>Not Found</h1>\n<p>The requested URL was not found on this server.</p>\n</body></html>\n"),
 			500: []byte("<!DOCTYPE HTML PUBLIC \"-//IETF//DTD HTML 2.0//EN\">\n<html><head>\n<title>500 Internal Server Error</title>\n</head><body>\n<h1>Internal Server Error</h1>\n<p>The server encountered an internal error or misconfiguration and was unable to complete your request.</p>\n</body></html>\n"),
@@ -383,6 +384,7 @@ var camouflageFamilies = []camouflageFamily{
 		contentType:  "text/html",
 		extraHeaders: []string{},
 		statusBodies: map[int][]byte{
+			400: []byte("<html><head><title>400 Bad Request</title></head>\n<body><h1>Bad Request</h1>\n<p>The request could not be understood.</p>\n</body></html>\n"),
 			403: []byte("<html><head><title>403 Forbidden</title></head>\n<body><h1>Forbidden</h1>\n<p>Access denied.</p>\n</body></html>\n"),
 			404: []byte("<html><head><title>404 Not Found</title></head>\n<body><h1>Not Found</h1>\n<p>The requested URL was not found on this server.</p>\n</body></html>\n"),
 			500: []byte("<html><head><title>500 Internal Server Error</title></head>\n<body><h1>Internal Server Error</h1>\n<p>Server error.</p>\n</body></html>\n"),
@@ -393,6 +395,7 @@ var camouflageFamilies = []camouflageFamily{
 		contentType:  "text/plain; charset=utf-8",
 		extraHeaders: []string{"Strict-Transport-Security: max-age=31536000"},
 		statusBodies: map[int][]byte{
+			400: []byte("400 Bad Request\n"),
 			403: []byte("403 Forbidden\n"),
 			404: []byte("404 page not found\n"),
 			500: []byte("500 Internal Server Error\n"),
@@ -407,6 +410,7 @@ var camouflageFamilies = []camouflageFamily{
 			"Vary: Accept-Encoding",
 		},
 		statusBodies: map[int][]byte{
+			400: []byte("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Error 400</title></head><body><center><h1>Error 400</h1></center><hr><center>cloudflare</center></body></html>\n"),
 			403: []byte("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Error 403</title></head><body><center><h1>Error 403</h1></center><hr><center>cloudflare</center></body></html>\n"),
 			404: []byte("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Error 404</title></head><body><center><h1>Error 404</h1></center><hr><center>cloudflare</center></body></html>\n"),
 			500: []byte("<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><title>Error 500</title></head><body><center><h1>Error 500</h1></center><hr><center>cloudflare</center></body></html>\n"),
@@ -419,6 +423,7 @@ var camouflageFamilies = []camouflageFamily{
 		contentType:  "text/plain; charset=utf-8",
 		extraHeaders: []string{"X-Content-Type-Options: nosniff"},
 		statusBodies: map[int][]byte{
+			400: []byte("400 Bad Request\n"),
 			403: []byte("Forbidden\n"),
 			404: []byte("404 page not found\n"),
 			500: []byte("Internal Server Error\n"),
@@ -439,6 +444,7 @@ var camouflageFamilies = []camouflageFamily{
 var pickedCamouflage *camouflageFamily
 
 var statusReasons = map[int]string{
+	400: "Bad Request",
 	403: "Forbidden",
 	404: "Not Found",
 	500: "Internal Server Error",
@@ -469,9 +475,9 @@ func pickRandomFamilyIdx() int {
 // resolveCloakFamily implements first-start-pick + persist + reuse-on-restart.
 // statePath: path next to PSK file (e.g. ./mxtr-cloak.idx). rotate=true
 // forces re-pick even if state exists.
-// resolvePersistedCN reads the cert CN from path. Fresh-picks a synthetic
-// CDN-edge name on first run or when rotate=true, and persists the choice
-// via atomic-replace + O_NOFOLLOW (mirrors PSK/cloak hardening). Real
+// resolvePersistedCN reads the cert CN from path. Fresh-picks a neutral
+// synthetic hostname on first run or when rotate=true, and persists the
+// choice via atomic-replace + O_NOFOLLOW (mirrors PSK/cloak hardening). Real
 // LE-cert path bypasses this entirely (operator-managed).
 func resolvePersistedCN(path string, rotate bool) string {
 	if !rotate {
@@ -854,23 +860,25 @@ func autoDetectPublicIP() string {
 	return ""
 }
 
-// CDN-edge hostname generator. The previous version drew from a 10-entry
-// pool — easy for an adversary to dictionary-block. This expanded space
-// composes a per-CDN realistic naming pattern with randomised parts,
-// yielding millions of unique CNs across deployments. RKN can't enumerate
-// the set and the *pattern* itself is what real CDNs publish, so each
-// generated CN looks like a legitimate edge name.
+// Synthetic hostname generator for the self-signed cert CN (which is also
+// the value the client sends as SNI). An earlier version impersonated named
+// CDNs (fastly.net, akamaiedge.net, bunnycdn.com, ...). That turned out to
+// be a liability, not camouflage: those names resolve to the CDN's published
+// anycast ranges, so a censor that resolves the SNI sees it claim Fastly
+// while the TCP destination is a plain VPS in some hosting ASN -- a
+// verifiable lie. And a self-signed cert bearing a real CDN's name is
+// impossible in the wild (those CDNs always serve CA-valid certs), so the
+// pairing is a one-probe giveaway.
 //
-// Each pattern is what its real CDN actually publishes (verified by
-// inspecting `dig` / Certificate Transparency logs):
-//   fastly      <region>-<node>.fastly-edge.net
-//   bunnycdn    node-<city>-<num>.bunnycdn.com
-//   cloudfront  <node><num>.<region>.cloudfront.net
-//   akamai      a<num>.<city>.edge.akamaiedge.net
-//   cdn77       pop-<city>-<num>.cdn77.org
-//   stackpath   edge-<city><num>.stackpathcdn.com
-//   gcdn        node<num>.<region>.gcdn.net
-//   generic     edge-<city>-<num>.cdn-cf.net
+// We drop the CDN cosplay. These names are infrastructure-flavoured but
+// modelled on no specific provider, so the resolve-and-disprove check yields
+// NXDOMAIN / nothing notable instead of a caught impersonation, and a
+// self-signed cert on a nameless small host is mundane (mail servers,
+// management UIs, fresh unconfigured boxes all do it). The randomised parts
+// keep the space large enough that it can't be dictionary-blocked. A truly
+// clean posture (SNI that resolves back into the VPS's own ASN) still needs
+// a real domain + LE cert via -cert/-key/-sni; that is operator-managed and
+// out of scope here.
 var cdnCities = []string{
 	"fra", "ams", "lon", "par", "mil", "sg", "hkg", "tyo", "syd", "sjc",
 	"lax", "ord", "dal", "mia", "jfk", "sfo", "dfw", "atl", "sea", "dub",
@@ -880,31 +888,49 @@ var cdnCities = []string{
 	"hnd", "gru", "scl", "mex", "lhr", "cdg", "ham", "tll", "vno", "rix",
 }
 
+// edgeApexes are neutral, hosting-flavoured apex domains across a few TLDs.
+// Each reads like a small generic hosting / datacenter operator, none is a
+// real CDN brand. Compound names are used on purpose: they are unlikely to
+// be a famous registered domain, so a censor resolving the SNI lands on
+// NXDOMAIN or some low-profile host rather than a name it can pin to a known
+// provider's ASN.
+var edgeApexes = []string{
+	"hosted-edge.net", "vmpool-cloud.com", "dc-nodes.net", "netregion-hosting.io",
+	"corenet-dc.net", "srvcloud-host.com", "racknode-systems.io", "edge-datacenter.net",
+	"datacore-hosting.com", "cloudspan-hosting.net", "regionhost-dc.com", "relaynode-mta.net",
+	"vmcluster-host.net", "gridnode-cloud.io", "metro-edge-dc.com", "northbridge-host.net",
+}
+
 func generateSyntheticCN() string {
-	city := cdnCities[mrand.IntN(len(cdnCities))]
-	num := mrand.IntN(99) + 1
-	// Six patterns, each modelled on a real CDN's publicly-visible naming.
-	switch mrand.IntN(6) {
+	region := cdnCities[mrand.IntN(len(cdnCities))]
+	num := mrand.IntN(999) + 1
+	apex := edgeApexes[mrand.IntN(len(edgeApexes))]
+	// Subdomain shape is also randomised, so the visible name is apex x shape
+	// x region x num -- a large, non-dictionary-able space.
+	switch mrand.IntN(7) {
 	case 0:
-		return fmt.Sprintf("%s%d.edge.fastly.net", city, num)
+		return fmt.Sprintf("srv%d-%s.%s", num, region, apex)
 	case 1:
-		return fmt.Sprintf("node-%s-%d.bunnycdn.com", city, num)
+		return fmt.Sprintf("node-%s-%d.%s", region, num, apex)
 	case 2:
-		return fmt.Sprintf("edge-%s%d.stackpathcdn.com", city, num)
+		return fmt.Sprintf("host%d.%s.%s", num, region, apex)
 	case 3:
-		return fmt.Sprintf("a%d.%s.edge.akamaiedge.net", num, city)
+		return fmt.Sprintf("edge-%s%d.%s", region, num, apex)
 	case 4:
-		return fmt.Sprintf("pop-%s-%d.cdn77.org", city, num)
+		return fmt.Sprintf("%s-gw%d.%s", region, num, apex)
 	case 5:
-		return fmt.Sprintf("node%d.%s.gcdn.net", num, city)
+		return fmt.Sprintf("vm%d.%s.%s", num, region, apex)
+	case 6:
+		return fmt.Sprintf("pop-%s-%d.%s", region, num, apex)
 	}
-	return fmt.Sprintf("edge-%s-%d.cdn-cf.net", city, num)
+	return fmt.Sprintf("n%d-%s.%s", num, region, apex)
 }
 
 var cdnOrgPool = []string{
-	"Edge Networks, Ltd.", "BunnyCDN s.r.o.", "Internet Services Inc.",
-	"Cloud Distribution AG", "Hyperion CDN GmbH", "CDN Solutions LLC",
-	"Fastly Edge B.V.", "Akamai Technologies Ltd.", "StackPath Holdings", "CDN77 s.r.o.",
+	"Edge Networks, Ltd.", "Internet Services Inc.", "Cloud Distribution AG",
+	"Hyperion Hosting GmbH", "Datacore Solutions LLC", "Netregion B.V.",
+	"Core Hosting s.r.o.", "VM Cloud Holdings", "Server Networks Ltd.",
+	"DC Nodes Inc.",
 }
 
 // generateSelfSignedCertWithCN builds a fresh ECDSA P-256 cert with the
@@ -1133,8 +1159,14 @@ func serveH2Camouflage(tlsConn *tls.Conn, label string) {
 }
 
 
+// version is the build version. Release builds override it via
+// -ldflags "-X main.version=<tag>" (see .github/workflows/release.yml);
+// the default below is the in-repo development version.
+var version = "0.2.2"
+
 func main() {
 	var (
+		showVer    = flag.Bool("version", false, "print version and exit")
 		tcpAddr    = flag.String("tcp", ":9290", "TCP listen address (empty to disable)")
 		pskHex     = flag.String("psk", "", "PSK as hex string (16+ bytes = 32+ hex chars); overrides -psk-file")
 		pskFile    = flag.String("psk-file", "./mxtr-psk.hex", "path to PSK file; created with random 32-byte PSK on first run if missing")
@@ -1150,6 +1182,10 @@ func main() {
 		allowList  = flag.String("allow", "", "comma-separated allowlist of target domains (subdomains auto-included; empty = allow all)")
 	)
 	flag.Parse()
+	if *showVer {
+		fmt.Println(version)
+		return
+	}
 	allowedDomains = parseAllowList(*allowList)
 	if len(allowedDomains) > 0 {
 		logInfof("target allowlist: %v", allowedDomains)
@@ -1163,6 +1199,7 @@ func main() {
 		chosen = LogOff
 	}
 	configureLogger(chosen)
+	logInfof("mxtr-server %s starting", version)
 
 	if *genPSK {
 		key := make([]byte, 32)
@@ -1292,7 +1329,7 @@ func main() {
 		log.Fatalf("-public-ip must be a public IPv4 or IPv6 literal (no hostnames, loopback, private, multicast, or unspecified); got %q", host)
 	}
 	// SNI default: if operator didn't override -sni, use the cert's CN.
-	// For self-signed path that's the synthetic CDN-edge name we just
+	// For self-signed path that's the neutral synthetic hostname we just
 	// generated/loaded; for -cert path that's the real domain. Either way,
 	// SNI matches the Subject the server presents — no "ClientHello SNI ≠
 	// cert subject" tell for passive observers.
