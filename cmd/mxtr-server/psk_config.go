@@ -26,6 +26,7 @@ type pskDerivedConfig struct {
 	heartbeatPadMin  int
 	heartbeatPadMax  int
 	idleThresholdMs  int
+	camouflageStatus int // pinned 403/404/500 for the generic camouflage page
 }
 
 // derivePskConfig produces the per-PSK runtime knobs. Salt + info are stable
@@ -53,6 +54,10 @@ func derivePskConfig(psk []byte) pskDerivedConfig {
 		heartbeatPadMin:  32 + int(out[4]),                                         // 32-287
 		heartbeatPadMax:  512 + int(binary.BigEndian.Uint16(out[5:7]))%3584,        // 512-4095
 		idleThresholdMs:  10_000 + int(out[8])*50,                                  // 10-22.75s
+		// Pinned per deploy (stable across requests and restarts, varies per PSK).
+		// A real server answers the same URL with the same status every time;
+		// a random-per-request status was itself a tell.
+		camouflageStatus: cloakStatuses[int(out[9])%len(cloakStatuses)],
 	}
 }
 

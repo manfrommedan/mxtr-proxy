@@ -450,13 +450,6 @@ var statusReasons = map[int]string{
 
 var cloakStatuses = []int{403, 404, 500}
 
-// pickRandomStatus returns one of 403/404/500 with uniform weight. Each
-// probe gets an independent draw so successive scans see a varied
-// distribution rather than a single pinned status.
-func pickRandomStatus() int {
-	return cloakStatuses[mrand.IntN(len(cloakStatuses))]
-}
-
 // pickRandomFamilyIdx picks an index via crypto/rand. Used by first-time
 // startup and by -rotate-cloak.
 func pickRandomFamilyIdx() int {
@@ -587,11 +580,13 @@ func pickCamouflageTemplate() *camouflageFamily {
 }
 
 // pickCamouflage returns the full HTTP/1.1 response bytes (status line +
-// headers + body). Status is drawn uniformly per call from {403,404,500}.
-// Used when readClientHandshake detects an HTTP/1.1 probe and writes raw
-// bytes back to the TLS conn.
+// headers + body) for the generic catch-all path. The status is pinned per
+// deploy (pskCfg.camouflageStatus): a real server answers the same URL with
+// the same code every time, so a stable status is the honest camouflage; a
+// random-per-request status was itself a tell. Used when readClientHandshake
+// detects an HTTP/1.1 probe and writes raw bytes back to the TLS conn.
 func pickCamouflage() []byte {
-	return renderCamouflage(pickCamouflageTemplate(), pickRandomStatus())
+	return renderCamouflage(pickCamouflageTemplate(), pskCfg.camouflageStatus)
 }
 
 var httpMethods = [][]byte{
@@ -1143,7 +1138,7 @@ func camouflageForPath(path string) []byte {
 // version is the build version. Release builds override it via
 // -ldflags "-X main.version=<tag>" (see .github/workflows/release.yml);
 // the default below is the in-repo development version.
-var version = "0.2.3"
+var version = "0.2.4"
 
 func main() {
 	var (
