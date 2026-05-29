@@ -51,17 +51,7 @@ mkdir -p /opt/mxtr-proxy/state
 chmod 700 /opt/mxtr-proxy/state
 
 # 2. Поднять. PSK сгенерится на первом старте и запишется в state/psk.hex.
-docker run -d --name mxtr-proxy \
-  --restart unless-stopped \
-  --network host \
-  --read-only \
-  --tmpfs /tmp:size=16m,mode=1777 \
-  --cap-drop ALL \
-  --security-opt no-new-privileges \
-  -v /opt/mxtr-proxy/state:/state \
-  --log-driver json-file --log-opt max-size=1m --log-opt max-file=3 \
-  ghcr.io/<you>/mxtr-proxy:latest \
-  -tcp :<port> -public-ip <vps-ip> -psk-file /state/psk.hex
+docker run -d --name mxtr-proxy --restart unless-stopped --network host --read-only --tmpfs /tmp:size=16m,mode=1777 --cap-drop ALL --security-opt no-new-privileges -v /opt/mxtr-proxy/state:/state --log-driver json-file --log-opt max-size=1m --log-opt max-file=3 ghcr.io/<you>/mxtr-proxy:latest -tcp :<port> -public-ip <vps-ip> -psk-file /state/psk.hex
 
 # 3. Проверить.
 docker logs mxtr-proxy 2>&1 | grep -E 'cert-cn|cloak|share-string|listening'
@@ -137,14 +127,7 @@ Let's Encrypt - получи cert на свой домен, прокинь фа�
 
 ```bash
 docker stop mxtr-proxy && docker rm mxtr-proxy
-docker run -d --name mxtr-proxy ... \
-  -v /etc/letsencrypt/live/<домен>/fullchain.pem:/secrets/cert.pem:ro \
-  -v /etc/letsencrypt/live/<домен>/privkey.pem:/secrets/key.pem:ro \
-  ghcr.io/<you>/mxtr-proxy:latest \
-  -tcp :443 -public-ip <vps-ip> \
-  -psk-file /state/psk.hex \
-  -cert /secrets/cert.pem -key /secrets/key.pem \
-  -sni <домен>
+docker run -d --name mxtr-proxy ... -v /etc/letsencrypt/live/<домен>/fullchain.pem:/secrets/cert.pem:ro -v /etc/letsencrypt/live/<домен>/privkey.pem:/secrets/key.pem:ro ghcr.io/<you>/mxtr-proxy:latest -tcp :443 -public-ip <vps-ip> -psk-file /state/psk.hex -cert /secrets/cert.pem -key /secrets/key.pem -sni <домен>
 ```
 
 На 443 + real LE + SNI=твой-домен сервер выглядит как обычный
@@ -171,8 +154,7 @@ PSK-leak не превратил тебя в open-relay):
 
 ```bash
 docker stop mxtr-proxy && docker rm mxtr-proxy
-docker run -d --name mxtr-proxy ... \
-  -allow matrix.org,element.io,call.matrix.org,turn.livekit.cloud
+docker run -d --name mxtr-proxy ... -allow matrix.org,element.io,call.matrix.org,turn.livekit.cloud
 ```
 
 Поддомены включаются автоматически (`matrix.org` покроет

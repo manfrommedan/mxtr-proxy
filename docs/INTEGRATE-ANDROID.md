@@ -305,8 +305,7 @@ scope.launch {
 # 1. Поднять локальный сервер
 go build -o mxtr-server ./cmd/mxtr-server
 mkdir -p /tmp/mxtr-state && chmod 700 /tmp/mxtr-state
-./mxtr-server -tcp :<port> -public-ip 127.0.0.1 \
-  -psk-file /tmp/mxtr-state/psk.hex -log-level debug &
+./mxtr-server -tcp :<port> -public-ip 127.0.0.1 -psk-file /tmp/mxtr-state/psk.hex -log-level debug &
 echo $!  # запомнить pid для kill
 # в stderr появится готовая share-string mxtr://...@127.0.0.1:<port>?sni=...
 
