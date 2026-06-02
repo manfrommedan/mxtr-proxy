@@ -9,8 +9,9 @@
 //   0x03 CLOSE    - either side: close stream
 //   0x04 PING     - keepalive
 //   0x05 PONG     - response to PING
-//   0x06 OPEN_OK  - server: stream opened
+//   0x06 OPEN_OK  - server: stream opened (payload = 4-byte BE initial send window)
 //   0x07 OPEN_ERR - server: dial failed (payload = error byte/text)
+//   0x08 WINDOW_UPDATE - server: credit N more client->upstream bytes (4-byte BE)
 //
 // stream_id 0 reserved for control. Client allocates 1, 3, 5, ...
 
@@ -34,23 +35,63 @@ import (
 const (
 	v2FrameHeader = 7 // 4 + 1 + 2
 
-	v2TypeOpen    = 0x01
-	v2TypeData    = 0x02
-	v2TypeClose   = 0x03
-	v2TypePing    = 0x04
-	v2TypePong    = 0x05
-	v2TypeOpenOK  = 0x06
-	v2TypeOpenErr = 0x07
+	v2TypeOpen         = 0x01
+	v2TypeData         = 0x02
+	v2TypeClose        = 0x03
+	v2TypePing         = 0x04
+	v2TypePong         = 0x05
+	v2TypeOpenOK       = 0x06
+	v2TypeOpenErr      = 0x07
+	v2TypeWindowUpdate = 0x08
 
-	v2StreamInBuf = 64
+	// v2InitialWindow is the per-stream client→upstream send window the server
+	// advertises in OPEN_OK. A flow-control-aware client keeps at most this many
+	// bytes in flight (sent but not yet credited); the server credits more via
+	// WINDOW_UPDATE as it drains to the upstream. This is what lets the proxy
+	// stay TRANSPARENT for arbitrarily large uploads: the client paces itself to
+	// the homeserver's real drain rate, so we hold ~window bytes in memory
+	// instead of the whole 100-500 MB file, and we NEVER drop a byte. 4 MiB sits
+	// well above a mobile-uplink bandwidth-delay product so the pipe stays full.
+	v2InitialWindow = 4 << 20
+	// v2WindowUpdateThreshold batches credits: the pump emits one WINDOW_UPDATE
+	// per this many drained bytes (or when its queue empties), instead of one per
+	// ~16 KB data frame, trading a little window slack for far fewer control
+	// frames.
+	v2WindowUpdateThreshold = v2InitialWindow / 2
+
+	// v2SessionBufferCap / v2GlobalBufferCap are SAFETY BACKSTOPS, not the normal
+	// path. With flow control a well-behaved client self-limits to v2InitialWindow
+	// per stream, so a session holds at most (active uploads)x4 MiB - a few MB in
+	// practice, far below these caps, and is never shed. The caps only bound a
+	// client that ignores WINDOW_UPDATE (older build) or an authenticated peer
+	// deliberately flooding: such a stream is shed once the budget is hit, which
+	// reclaims memory without HoL-stalling the session's other streams. The
+	// session cap is sized above any realistic concurrent-upload count so flow-
+	// controlled clients never trip it; the global cap is the hard host-memory
+	// ceiling across all sessions. Both are tunable for the deployment's RAM.
+	v2SessionBufferCap = 128 << 20
+	v2GlobalBufferCap  = 256 << 20
 )
 
 type v2Stream struct {
 	id      uint32
 	conn    net.Conn
-	in      chan []byte
 	closing chan struct{}
 	closed  atomic.Bool
+
+	// client→upstream pending chunks held as a byte-bounded queue (not a
+	// fixed-count channel) so the shared session read loop NEVER blocks on one
+	// slow stream (CR-01: blocking the loop HoL-stalls every other stream
+	// including PING/PONG/CLOSE) and NEVER silently drops a progressing upload
+	// (the old 64-frame channel overflowed at ~1 MB and closed the stream
+	// mid-upload, truncating any larger media so the recipient saw 0 bytes / no
+	// MIME). The pump goroutine drains it; the read loop only sheds this stream
+	// when the session/global byte budget is exceeded. cond is signalled on
+	// enqueue and on close. queue/qbytes are guarded by mu.
+	mu     sync.Mutex
+	cond   *sync.Cond
+	queue  [][]byte
+	qbytes int64 // sum of len(queue[i]); reclaimed from the byte budgets on close
 }
 
 // v2MaxConcurrentOpens caps in-flight OPEN dispatches per session so one
@@ -75,11 +116,17 @@ type v2Session struct {
 	closed       atomic.Bool  // set true by closeAll; checked by handleOpen to avoid leaks
 	lastActivity atomic.Int64 // last frame in either direction (used by reaper)
 	lastWriteAt  atomic.Int64 // last server-to-client frame (used by heartbeat)
+	buffered     atomic.Int64 // client→upstream bytes queued across all streams (vs v2SessionBufferCap)
 }
 
 // v2Sessions tracks live v2 sessions so a single reaper goroutine can close
 // those silent for too long. sync.Map gives lock-free reads in the reap loop.
 var v2Sessions sync.Map // int64 -> *v2Session
+
+// v2GlobalBuffered counts client→upstream bytes queued across ALL sessions, the
+// hard backstop behind each session's v2SessionBufferCap so a fleet of
+// simultaneously-wedged upstreams can't exhaust host memory (v2GlobalBufferCap).
+var v2GlobalBuffered atomic.Int64
 
 const v2SessionIdleTimeout = 5 * time.Minute
 
@@ -203,6 +250,17 @@ func (s *v2Session) closeAll() {
 			st := v.(*v2Stream)
 			if st.closed.CompareAndSwap(false, true) {
 				close(st.closing)
+				// The session's own buffered counter dies with the session, but
+				// the process-global one must be reclaimed or it leaks upward.
+				// Wake the pump so it exits instead of parking forever in Wait.
+				st.mu.Lock()
+				if st.qbytes > 0 {
+					v2GlobalBuffered.Add(-st.qbytes)
+					st.qbytes = 0
+				}
+				st.queue = nil
+				st.cond.Broadcast()
+				st.mu.Unlock()
 				if st.conn != nil {
 					_ = st.conn.Close()
 				}
@@ -221,11 +279,24 @@ func (s *v2Session) closeStream(streamID uint32) {
 	st := v.(*v2Stream)
 	if st.closed.CompareAndSwap(false, true) {
 		close(st.closing)
+		// Reclaim this stream's queued client→upstream bytes from the session
+		// and global budgets, drop the buffer, and wake the pump (which may be
+		// parked in cond.Wait on an empty queue) so it exits promptly.
+		st.mu.Lock()
+		if st.qbytes > 0 {
+			s.buffered.Add(-st.qbytes)
+			v2GlobalBuffered.Add(-st.qbytes)
+			st.qbytes = 0
+		}
+		st.queue = nil
+		st.cond.Broadcast()
+		st.mu.Unlock()
 		// CR2-01: close the upstream socket too. Without this, the
 		// upstream→client reader goroutine sits in a blocking upstream.Read
 		// and only checks closing AFTER the read returns — which for an idle
 		// peer (HTTP keep-alive, IMAP IDLE, websocket) can be hours. Closing
-		// the conn here unblocks the read with ErrClosedConn immediately.
+		// the conn here unblocks the read with ErrClosedConn immediately, and
+		// also unblocks the pump if it is parked in upstream.Write.
 		if st.conn != nil {
 			_ = st.conn.Close()
 		}
@@ -255,9 +326,9 @@ func (s *v2Session) handleOpen(streamID uint32, targetSpec []byte) {
 	st := &v2Stream{
 		id:      streamID,
 		conn:    upstream,
-		in:      make(chan []byte, v2StreamInBuf),
 		closing: make(chan struct{}),
 	}
+	st.cond = sync.NewCond(&st.mu)
 	if _, loaded := s.streams.LoadOrStore(streamID, st); loaded {
 		upstream.Close()
 		logInfof("[v2-%d] stream %d already exists; refusing", s.id, streamID)
@@ -271,7 +342,13 @@ func (s *v2Session) handleOpen(streamID uint32, targetSpec []byte) {
 		upstream.Close()
 		return
 	}
-	if err := s.writeStreamFrame(streamID, v2TypeOpenOK, nil); err != nil {
+	// OPEN_OK carries the initial per-stream send window. A flow-control-aware
+	// client paces its client→upstream writes to this and to the WINDOW_UPDATE
+	// credits below, so the proxy never has to drop a byte of a large upload.
+	// Older clients ignore the payload and rely on the buffer-cap backstop.
+	var initWin [4]byte
+	binary.BigEndian.PutUint32(initWin[:], uint32(v2InitialWindow))
+	if err := s.writeStreamFrame(streamID, v2TypeOpenOK, initWin[:]); err != nil {
 		s.closeStream(streamID)
 		upstream.Close()
 		return
@@ -305,19 +382,57 @@ func (s *v2Session) handleOpen(streamID uint32, targetSpec []byte) {
 		}
 	}()
 
-	// client → upstream (drain st.in, write to target)
+	// client → upstream pump: drain the byte-bounded queue and write to the
+	// target. Parks in st.cond.Wait while the queue is empty (signalled by the
+	// read loop's enqueue and by close), so the session read loop hands off
+	// without ever blocking. On a write error we also send the peer a CLOSE so
+	// the sender learns its upload failed instead of seeing bytes silently
+	// vanish — the old drop path notified nothing, which is exactly how a
+	// truncated upload surfaced as "0 bytes / no MIME" on the receiver.
 	go func() {
+		var credited int64 // bytes drained since the last WINDOW_UPDATE (batched)
 		for {
-			select {
-			case data := <-st.in:
-				if _, err := upstream.Write(data); err != nil {
+			st.mu.Lock()
+			for len(st.queue) == 0 && !st.closed.Load() {
+				st.cond.Wait()
+			}
+			if st.closed.Load() {
+				st.mu.Unlock()
+				return
+			}
+			chunk := st.queue[0]
+			st.queue[0] = nil // let the consumed chunk be GC'd before realloc
+			st.queue = st.queue[1:]
+			emptyNow := len(st.queue) == 0
+			if emptyNow {
+				st.queue = nil // release the backing array once fully drained
+			}
+			n := int64(len(chunk))
+			st.qbytes -= n
+			s.buffered.Add(-n)
+			v2GlobalBuffered.Add(-n)
+			st.mu.Unlock()
+			if _, err := upstream.Write(chunk); err != nil {
+				_ = s.writeStreamFrame(streamID, v2TypeClose, nil)
+				upstream.Close()
+				s.closeStream(streamID)
+				return
+			}
+			// Flow control: credit the client for the bytes we just delivered so
+			// it may send that much more without ever overrunning our buffer.
+			// Batch to v2WindowUpdateThreshold, but always flush once the queue is
+			// empty so the tail of an upload can't stall waiting on a credit the
+			// threshold never reaches.
+			credited += n
+			if credited >= v2WindowUpdateThreshold || (emptyNow && credited > 0) {
+				var wu [4]byte
+				binary.BigEndian.PutUint32(wu[:], uint32(credited))
+				if err := s.writeStreamFrame(streamID, v2TypeWindowUpdate, wu[:]); err != nil {
 					upstream.Close()
 					s.closeStream(streamID)
 					return
 				}
-			case <-st.closing:
-				upstream.Close()
-				return
+				credited = 0
 			}
 		}
 	}()
@@ -436,20 +551,34 @@ func handleTCPv2(conn net.Conn) {
 				continue
 			}
 			st := v.(*v2Stream)
-			payloadCopy := append([]byte(nil), payload...)
-			// Non-blocking send: when a single upstream is wedged its in-queue
-			// fills up; rather than backpressure into the session read loop
-			// (which would HoL-block every other live stream on the session
-			// including PING/CLOSE/OPEN_OK), drop the slow stream. The peer
-			// gets a CLOSE and can reopen if it wants to retry.
-			select {
-			case st.in <- payloadCopy:
-			case <-st.closing:
-			default:
-				logInfof("[v2-%d] stream %d in-queue full, closing to unblock session", id, streamID)
+			plen := int64(payloadLen)
+			// Hand the chunk to the per-stream pump without ever blocking the
+			// shared read loop (CR-01) and without silently dropping a
+			// progressing upload (the old fixed channel overflowed at ~1 MB and
+			// truncated larger media). We only shed THIS stream when the
+			// session-wide or global pending-byte budget would be exceeded —
+			// i.e. its upstream is wedged or sustained-slower than the peer
+			// sends — which reclaims memory without HoL-stalling the session's
+			// other streams. The peer gets a CLOSE so the upload fails loudly.
+			if sess.buffered.Load()+plen > v2SessionBufferCap || v2GlobalBuffered.Load()+plen > v2GlobalBufferCap {
+				logInfof("[v2-%d] stream %d: client→upstream buffer budget reached (sess=%d global=%d); shedding stream",
+					id, streamID, sess.buffered.Load(), v2GlobalBuffered.Load())
 				_ = sess.writeStreamFrame(streamID, v2TypeClose, nil)
 				sess.closeStream(streamID)
+				continue
 			}
+			payloadCopy := append([]byte(nil), payload...)
+			st.mu.Lock()
+			if st.closed.Load() {
+				st.mu.Unlock()
+				continue
+			}
+			st.queue = append(st.queue, payloadCopy)
+			st.qbytes += plen
+			sess.buffered.Add(plen)
+			v2GlobalBuffered.Add(plen)
+			st.cond.Signal()
+			st.mu.Unlock()
 		case v2TypeClose:
 			sess.closeStream(streamID)
 		case v2TypePing:

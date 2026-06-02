@@ -1138,7 +1138,7 @@ func camouflageForPath(path string) []byte {
 // version is the build version. Release builds override it via
 // -ldflags "-X main.version=<tag>" (see .github/workflows/release.yml);
 // the default below is the in-repo development version.
-var version = "0.2.4"
+var version = "0.3.0"
 
 func main() {
 	var (
