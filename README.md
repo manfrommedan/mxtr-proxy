@@ -125,6 +125,10 @@ PSK, target-allowlist, compose, LE-сертификат) - см.
 - Один long-lived TLS-сокет на всю сессию, N параллельных потоков
   внутри (stream mux). Handshake платится один раз, дальше /sync,
   /messages, /upload идут поверх.
+- Большие файлы без обрывов: per-stream flow control (оконный, как в
+  HTTP/2) пейсит аплоад под скорость homeserver'а - прокси не режет
+  передачу и не держит файл в памяти целиком, 100-500 МБ заливаются
+  потоково и без потерь (память на стрим ограничена окном, неск. МБ).
 - Батарея: reader thread blocking (никаких polling-loop'ов),
   heartbeat 20-90 сек, ChaCha20-Poly1305 на ARM-у ~150 МБ/с/core.
   Поверх того, что Element X уже жрёт на /sync, оверхед нулевой.

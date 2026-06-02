@@ -51,22 +51,23 @@ import (
 )
 
 const (
-	nonceLen        = 16
-	macLen          = 16
-	maxHandshakePad = 255
-	maxPlaintext    = 16384 - 2
-	maxPadded       = 16384
-	maxCiphertext   = maxPadded + 16
-	frameHeader     = 7
+	nonceLen           = 16
+	macLen             = 16
+	maxHandshakePad    = 255
+	maxPlaintext       = 16384 - 2
+	maxPadded          = 16384
+	maxCiphertext      = maxPadded + 16
+	frameHeader        = 7
 	maxStreamPayloadV2 = maxPlaintext - frameHeader
 
-	typeOpen    byte = 0x01
-	typeData    byte = 0x02
-	typeClose   byte = 0x03
-	typePing    byte = 0x04
-	typePong    byte = 0x05
-	typeOpenOK  byte = 0x06
-	typeOpenErr byte = 0x07
+	typeOpen         byte = 0x01
+	typeData         byte = 0x02
+	typeClose        byte = 0x03
+	typePing         byte = 0x04
+	typePong         byte = 0x05
+	typeOpenOK       byte = 0x06
+	typeOpenErr      byte = 0x07
+	typeWindowUpdate byte = 0x08
 )
 
 // padSizes mirrors mxtr-server's PADME-style 13-rung ladder. Both ends pad
@@ -294,6 +295,17 @@ type stream struct {
 	closeMu      sync.Mutex // serialises closed-set + channel-close, gates deliver
 	pendingChunk []byte
 	pendingPos   int
+
+	// client->upstream send window (flow control), mirrors the Kotlin client:
+	// the server advertises the initial value in OPEN_OK and tops it up with
+	// WINDOW_UPDATE frames as it drains to the upstream. acquireWindow blocks
+	// sends once it is exhausted, so a large upload paces to the upstream's
+	// rate and never overruns the proxy. flowControlled stays false against an
+	// older server (empty OPEN_OK), preserving the prior unbounded-send path.
+	winMu          sync.Mutex
+	winCond        *sync.Cond
+	sendWindow     int64
+	flowControlled bool
 }
 
 // deliver hands a frame payload to the reader side under closeMu so a racing
@@ -318,7 +330,33 @@ func (st *stream) markClosed() bool {
 		return false
 	}
 	close(st.incoming)
+	// Wake any writer blocked on the send window so it errors out instead of
+	// hanging when the stream/session goes away.
+	if st.winCond != nil {
+		st.winMu.Lock()
+		st.winCond.Broadcast()
+		st.winMu.Unlock()
+	}
 	return true
+}
+
+// acquireWindow blocks until the send window has room for n bytes, the server
+// credits it (WINDOW_UPDATE), or the stream closes. No-op when the server
+// advertised no window (older build), so behaviour there is unchanged.
+func (st *stream) acquireWindow(n int) error {
+	st.winMu.Lock()
+	defer st.winMu.Unlock()
+	if !st.flowControlled {
+		return nil
+	}
+	for st.sendWindow < int64(n) {
+		if st.closed.Load() {
+			return errors.New("stream closed while awaiting send window")
+		}
+		st.winCond.Wait()
+	}
+	st.sendWindow -= int64(n)
+	return nil
 }
 
 type session struct {
@@ -475,6 +513,14 @@ func (s *session) readLoop() {
 		switch t {
 		case typeOpenOK:
 			if st != nil {
+				// OPEN_OK from a flow-control-aware server carries the 4-byte
+				// initial send window; older servers send an empty payload.
+				if len(payload) >= 4 {
+					st.winMu.Lock()
+					st.sendWindow = int64(binary.BigEndian.Uint32(payload))
+					st.flowControlled = true
+					st.winMu.Unlock()
+				}
 				select {
 				case st.openOK <- struct{}{}:
 				default:
@@ -491,6 +537,13 @@ func (s *session) readLoop() {
 			if st != nil {
 				cp := append([]byte(nil), payload...)
 				st.deliver(cp)
+			}
+		case typeWindowUpdate:
+			if st != nil && len(payload) >= 4 {
+				st.winMu.Lock()
+				st.sendWindow += int64(binary.BigEndian.Uint32(payload))
+				st.winCond.Broadcast()
+				st.winMu.Unlock()
 			}
 		case typeClose:
 			if st != nil {
@@ -513,6 +566,7 @@ func (s *session) open(targetHost string, targetPort int) (*stream, error) {
 		openOK:   make(chan struct{}, 1),
 		openErr:  make(chan string, 1),
 	}
+	st.winCond = sync.NewCond(&st.winMu)
 	s.streams.Store(sid, st)
 
 	hb := []byte(targetHost)
@@ -668,6 +722,9 @@ func handleSocks5(sess *session, c net.Conn) {
 					if chunk > maxStreamPayloadV2 {
 						chunk = maxStreamPayloadV2
 					}
+					if werr := st.acquireWindow(chunk); werr != nil {
+						break
+					}
 					if werr := sess.writeStreamFrame(st.id, typeData, bbuf[offset:offset+chunk]); werr != nil {
 						break
 					}
@@ -728,6 +785,9 @@ func (w *streamWriter) Write(p []byte) (int, error) {
 		if chunk > maxStreamPayloadV2 {
 			chunk = maxStreamPayloadV2
 		}
+		if err := w.st.acquireWindow(chunk); err != nil {
+			return off, err
+		}
 		if err := w.sess.writeStreamFrame(w.st.id, typeData, p[off:off+chunk]); err != nil {
 			return off, err
 		}
@@ -741,8 +801,10 @@ type streamConn struct {
 	sess *session
 }
 
-func (c *streamConn) Read(p []byte) (int, error)         { return c.st.Read(p) }
-func (c *streamConn) Write(p []byte) (int, error)        { return (&streamWriter{st: c.st, sess: c.sess}).Write(p) }
+func (c *streamConn) Read(p []byte) (int, error) { return c.st.Read(p) }
+func (c *streamConn) Write(p []byte) (int, error) {
+	return (&streamWriter{st: c.st, sess: c.sess}).Write(p)
+}
 func (c *streamConn) Close() error                       { c.sess.writeStreamFrame(c.st.id, typeClose, nil); return nil }
 func (c *streamConn) LocalAddr() net.Addr                { return &net.TCPAddr{} }
 func (c *streamConn) RemoteAddr() net.Addr               { return &net.TCPAddr{} }
