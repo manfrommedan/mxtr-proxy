@@ -2,7 +2,7 @@
 # up -d --build`. Put a .env next to this file (chmod 600):
 #
 #   MXTR_PSK=<64-hex-char PSK from `docker run --rm mxtr-proxy -gen-psk`>
-#   MXTR_PUBLIC_HOST=your-vps.example.com
+#   MXTR_PUBLIC_IP=<your VPS public IPv4/IPv6 literal; clients connect by IP, no DNS>
 #   # Optional target allowlist (subdomains auto-included, no wildcard syntax):
 #   MXTR_ALLOW=matrix.org,element.io
 
@@ -25,8 +25,8 @@ services:
       - ":9290"
       - "-log-level"
       - "info"
-      - "-public-host"
-      - "${MXTR_PUBLIC_HOST:-}"
+      - "-public-ip"
+      - "${MXTR_PUBLIC_IP:-}"
       # Conditional via shell expansion: docker compose doesn't have if/else,
       # but an empty -allow value is rejected at parse time, so leave the
       # flag out entirely when MXTR_ALLOW is unset. Override `command` in an

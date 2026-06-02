@@ -1,7 +1,7 @@
 #!/bin/sh
 # mxtr-proxy installer. One-shot.
 #
-#   curl -fsSL https://raw.githubusercontent.com/manfrommedan/mxtr-proxy/main/install.sh | sh -s your-vps.example.com
+#   curl -fsSL https://raw.githubusercontent.com/manfrommedan/mxtr-proxy/main/install.sh | sh -s 203.0.113.10
 #
 # Requires: docker + curl. Runs as root (writes /etc/mxtr-proxy/).
 #
@@ -27,8 +27,8 @@ for arg in "$@"; do
   case "$arg" in
     --rotate) ROTATE=1 ;;
     --help|-h)
-      echo "Usage: $0 [--rotate] <public-host>"
-      echo "  <public-host>  hostname or IP that clients will connect to"
+      echo "Usage: $0 [--rotate] <public-ip>"
+      echo "  <public-ip>    public IPv4/IPv6 literal clients connect to (no hostname; server validates it)"
       echo "  --rotate       force-regenerate PSK (invalidates existing clients)"
       exit 0 ;;
     -*) die "unknown flag: $arg" ;;
@@ -36,7 +36,7 @@ for arg in "$@"; do
   esac
 done
 
-[ -n "$HOST" ] || die "missing <public-host> argument. Try: $0 your-vps.example.com"
+[ -n "$HOST" ] || die "missing <public-ip> argument. Try: $0 203.0.113.10"
 
 mkdir -p "$ETC"
 chmod 700 "$ETC"
@@ -50,7 +50,7 @@ if [ -f "$ETC/mxtr.env" ] && [ "$ROTATE" -eq 0 ]; then
 else
   echo "mxtr: generating new PSK"
   MXTR_PSK=$(docker run --rm "$IMAGE" -gen-psk | tr -d '\r\n')
-  printf 'MXTR_PSK=%s\nMXTR_PUBLIC_HOST=%s\n' "$MXTR_PSK" "$HOST" > "$ETC/mxtr.env"
+  printf 'MXTR_PSK=%s\nMXTR_PUBLIC_IP=%s\n' "$MXTR_PSK" "$HOST" > "$ETC/mxtr.env"
   chmod 600 "$ETC/mxtr.env"
 fi
 
@@ -69,7 +69,7 @@ docker run -d \
   --log-driver json-file --log-opt max-size=1m --log-opt max-file=3 \
   -e MXTR_PSK="$MXTR_PSK" \
   "$IMAGE" \
-  -tcp ":$PORT" -public-host "$HOST" -log-level info >/dev/null
+  -tcp ":$PORT" -public-ip "$HOST" -log-level info >/dev/null
 
 sleep 1
 if ! docker ps --format '{{.Names}}' | grep -q "^${NAME}\$"; then
